@@ -1,0 +1,43 @@
+# Validation rules for VPK contents. Customize as needed.
+max_size_mb: 600
+require_files:
+  - addoninfo.txt
+# Glob patterns matched case-insensitively against normalized paths inside the VPK
+block_globs:
+  - "cfg/**"
+  - "bin/**"
+  - "addons/**"
+  - "*.exe"
+  - "*.dll"
+  - "*.so"
+  - "*.bat"
+  - "*.vbs"
+  - "*.ps1"
+  - "*.sh"
+  - "gameinfo.txt"
+  - "steam_appid.txt"
+  - "left4dead2/**"
+warn_globs:
+  - "resource/closecaption_*"
+  - "scripts/vscripts/**"
+allow_extensions:
+  - .bsp
+  - .bsp.lzma
+  - .nav
+  - .txt
+  - .vtf
+  - .vmt
+  - .mdl
+  - .vvd
+  - .vtx
+  - .ani
+  - .phy
+  - .mp3
+  - .wav
+  - .ogg
+  - .dds
+  - .vpcf
+  - .nut
+  - .res
+  - .png
+  - .jpg

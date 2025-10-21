@@ -1,0 +1,18 @@
+version: "3.9"
+services:
+  uploader:
+    image: ${DOCKER_IMAGE:-yourdockerhubname/vpk-uploader:latest}
+    ports:
+      - "8080:8080"            # 映射网页端口
+    environment:
+      - APP_SECRET=${APP_SECRET:?set-a-long-random-secret}
+      - ADMIN_USER=${ADMIN_USER:-admin}
+      - ADMIN_PASS=${ADMIN_PASS:-admin123}
+      - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-1024}
+      - DEFAULT_GUEST_TTL_HOURS=${DEFAULT_GUEST_TTL_HOURS:-24}
+      - TZ=${TZ:-Asia/Shanghai}
+    volumes:
+      - ./data:/app/data         # 将下载/存储目录暴露到宿主机
+      # 如需自定义规则，解除下行注释：
+      # - ./rules.yml:/app/rules.yml:ro
+    restart: unless-stopped

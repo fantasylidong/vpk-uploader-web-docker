@@ -1,0 +1,20 @@
+# Git
+.git
+.gitignore
+.github
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.venv
+venv
+
+# Docker build noise
+Dockerfile*
+!Dockerfile
+
+# Local data
+/data/

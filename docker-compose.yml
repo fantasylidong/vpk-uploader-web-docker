@@ -1,0 +1,17 @@
+version: "3.9"
+services:
+  uploader:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - APP_SECRET=replace-with-a-long-random-string
+      - ADMIN_USER=admin
+      - ADMIN_PASS=admin123
+      - MAX_UPLOAD_MB=1024
+      - DEFAULT_GUEST_TTL_HOURS=24
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./data:/app/data
+      - ./rules.yml:/app/rules.yml:ro
+    restart: unless-stopped

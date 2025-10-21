@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>管理员登录</h2>
+  <form action="/admin/login" method="post">
+    <label>用户名 <input name="username" required></label>
+    <label>密码 <input type="password" name="password" required></label>
+    <button type="submit">登录</button>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  </form>
+</section>
+{% endblock %}

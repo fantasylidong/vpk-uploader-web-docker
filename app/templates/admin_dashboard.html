@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>管理员面板</h2>
+  <form action="/admin/upload" method="post" enctype="multipart/form-data" class="row">
+    <div>
+      <input type="file" name="file" accept=".vpk" required>
+    </div>
+    <div>
+      <label>有效期（小时，0=永久） <input type="number" min="0" name="ttl_hours" value="0"></label>
+    </div>
+    <div>
+      <button type="submit">上传</button>
+    </div>
+  </form>
+
+  <form method="get" action="/admin" class="row">
+    <input name="q" value="{{ q }}" placeholder="按原始文件名搜索">
+    <button type="submit">搜索</button>
+    <a class="link" href="/admin/logout">退出</a>
+  </form>
+
+  <table class="table">
+    <thead>
+      <tr>
+        <th>ID</th><th>文件名</th><th>大小(MB)</th><th>角色</th><th>创建时间</th><th>到期</th><th>状态</th><th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for it in items %}
+      <tr>
+        <td>{{ it.id }}</td>
+        <td><a href="/detail/{{ it.id }}">{{ it.original_name }}</a></td>
+        <td>{{ ('%.2f' % (it.size/1024/1024)) }}</td>
+        <td>{{ it.role }}</td>
+        <td>{{ it.created_at }}</td>
+        <td>{% if it.expires_at %}{{ it.expires_at }}{% else %}<span class="tag">永久</span>{% endif %}</td>
+        <td>{{ it.status }}</td>
+        <td class="row">
+          <a class="btn" href="/d/{{ it.id }}/{{ it.original_name }}" target="_blank">下载</a>
+          <form action="/admin/set_expiry/{{ it.id }}" method="post">
+            <input type="number" name="hours" min="0" placeholder="小时">
+            <button>设定</button>
+          </form>
+          <form action="/admin/delete/{{ it.id }}" method="post" onsubmit="return confirm('确定删除?')">
+            <button class="danger">删除</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

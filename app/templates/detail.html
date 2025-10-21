@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>文件详情 #{{ item.id }}</h2>
+  <p><strong>原始文件名：</strong>{{ item.original_name }}</p>
+  <p><strong>大小：</strong>{{ ('%.2f' % (item.size/1024/1024)) }} MB</p>
+  <p><strong>SHA256：</strong>{{ item.sha256 }}</p>
+  <p><strong>状态：</strong>{{ item.status }} {% if item.expires_at %}（到期：{{ item.expires_at }}）{% else %}（永久）{% endif %}</p>
+  <p><a class="btn" href="/d/{{ item.id }}/{{ item.original_name }}">下载</a></p>
+  <details open>
+    <summary>VPK 校验报告</summary>
+    <pre>{{ report | tojson }}</pre>
+  </details>
+</section>
+{% endblock %}

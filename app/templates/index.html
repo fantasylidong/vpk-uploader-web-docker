@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>公共上传（自动保留 {{ guest_ttl_hours }} 小时）</h2>
+  <form action="/upload" method="post" enctype="multipart/form-data">
+    <input type="file" name="file" accept=".vpk" required>
+    <button type="submit">上传 .vpk</button>
+    <p class="muted">单文件上限：{{ max_mb }} MB，仅允许 .vpk</p>
+  </form>
+  {% if error %}
+    <div class="error">{{ error }}</div>
+  {% endif %}
+  {% if report %}
+    <details open>
+      <summary>校验报告</summary>
+      <pre>{{ report | tojson }}</pre>
+    </details>
+  {% endif %}
+</section>
+{% endblock %}
