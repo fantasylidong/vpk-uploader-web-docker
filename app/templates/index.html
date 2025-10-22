@@ -5,7 +5,7 @@
   <form action="/upload" method="post" enctype="multipart/form-data">
     <input type="file" name="file" accept=".vpk" required>
     <button type="submit">上传 .vpk</button>
-    <p class="muted">单文件上限：{{ max_mb }} MB，仅允许 .vpk</p>
+    <p class="muted">单文件上限：{{ max_mb }} MB，仅允许 .vpk；上传完成后仅保留“服务器版”</p>
   </form>
   {% if error %}
     <div class="error">{{ error }}</div>

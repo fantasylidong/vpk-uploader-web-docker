@@ -13,7 +13,7 @@ from fastapi.templating import Jinja2Templates
 from itsdangerous import URLSafeSerializer, BadSignature
 
 from .vpkcheck import validate_vpk, ValidationResult
-from .vpk_tools import process_map_vpk
+from .vpk_tools import process_server_vpk
 from .db import init_db, SessionLocal, Upload
 
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret-change-me")
@@ -94,8 +94,7 @@ async def index(request: Request):
         "guest_ttl_hours": DEFAULT_GUEST_TTL_HOURS
     })
 
-@app.post("/upload")
-async def guest_upload(request: Request, file: UploadFile):
+async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hours: Optional[int]):
     if not file.filename.lower().endswith(".vpk"):
         raise HTTPException(status_code=400, detail="只允许上传 .vpk 文件")
 
@@ -119,33 +118,49 @@ async def guest_upload(request: Request, file: UploadFile):
             sha256.update(chunk)
             out.write(chunk)
 
+    # 校验 VPK
     vr: ValidationResult = validate_vpk(tmp_path, RULES_FILE)
     if not vr.ok:
         os.remove(tmp_path)
-        return templates.TemplateResponse("index.html", {
+        return None, templates.TemplateResponse("index.html" if role=="guest" else "admin_dashboard.html", {
             "request": request,
             "max_mb": MAX_UPLOAD_MB,
             "guest_ttl_hours": DEFAULT_GUEST_TTL_HOURS,
             "error": "VPK 不符合要求",
             "report": vr.to_dict(),
+            "items": [] if role!="guest" else None,
+            "q": "" if role!="guest" else None
         })
 
-    stored = f"{sha256.hexdigest()}_{secrets.token_hex(4)}.vpk"
-    final_path = os.path.join(UPLOAD_DIR, stored)
-    shutil.move(tmp_path, final_path)
+    # 仅保留服务器版：直接重打包为 _server.vpk，删除原文件
+    stored_base = f"{sha256.hexdigest()}_{secrets.token_hex(4)}"
+    stored_name = f"{stored_base}_server.vpk"
+    build_report = process_server_vpk(tmp_path, UPLOAD_DIR, stored_name)
+    try:
+        os.remove(tmp_path)
+    except Exception:
+        pass
 
+    # 记录数据库（以服务器版为最终存储）
     db = SessionLocal()
     try:
+        expires_at = None
+        if role == "guest":
+            expires_at = now_utc() + timedelta(hours=DEFAULT_GUEST_TTL_HOURS)
+        else:
+            if ttl_hours is not None and ttl_hours > 0:
+                expires_at = now_utc() + timedelta(hours=ttl_hours)
+        server_path = os.path.join(UPLOAD_DIR, stored_name)
         up = Upload(
             original_name=file.filename,
-            stored_name=stored,
+            stored_name=stored_name,
             sha256=sha256.hexdigest(),
-            size=read_bytes,
-            role="guest",
+            size=os.path.getsize(server_path) if os.path.exists(server_path) else 0,
+            role=role,
             created_at=now_utc(),
-            expires_at=now_utc() + timedelta(hours=DEFAULT_GUEST_TTL_HOURS),
+            expires_at=expires_at,
             vpk_valid=True,
-            vpk_report=json.dumps(vr.to_dict(), ensure_ascii=False),
+            vpk_report=json.dumps({"validation": vr.to_dict(), "server_build": build_report}, ensure_ascii=False),
             status="active",
             uploader_ip=request.client.host if request.client else None,
         )
@@ -155,6 +170,13 @@ async def guest_upload(request: Request, file: UploadFile):
     finally:
         db.close()
 
+    return up, None
+
+@app.post("/upload")
+async def guest_upload(request: Request, file: UploadFile):
+    up, resp = await _handle_upload(request, file, role="guest", ttl_hours=None)
+    if resp is not None:
+        return resp
     return RedirectResponse(url=f"/detail/{up.id}", status_code=302)
 
 def require_admin(request: Request):
@@ -202,74 +224,11 @@ async def admin_home(request: Request):
     })
 
 @app.post("/admin/upload")
-async def admin_upload(request: Request, file: UploadFile, ttl_hours: Optional[int] = Form(None), process_map: Optional[int] = Form(None)):
+async def admin_upload(request: Request, file: UploadFile, ttl_hours: Optional[int] = Form(None)):
     require_admin(request)
-    if not file.filename.lower().endswith(".vpk"):
-        raise HTTPException(status_code=400, detail="只允许上传 .vpk 文件")
-
-    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
-    tmp_name = f"tmp_{secrets.token_hex(8)}.vpk"
-    tmp_path = os.path.join(TMP_DIR, tmp_name)
-
-    read_bytes = 0
-    sha256 = hashlib.sha256()
-
-    with open(tmp_path, "wb") as out:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            read_bytes += len(chunk)
-            if read_bytes > max_bytes:
-                out.close()
-                os.remove(tmp_path)
-                raise HTTPException(status_code=400, detail=f"文件过大，超过 {MAX_UPLOAD_MB} MB 限制")
-            sha256.update(chunk)
-            out.write(chunk)
-
-    vr = validate_vpk(tmp_path, RULES_FILE)
-    if not vr.ok:
-        os.remove(tmp_path)
-        return RedirectResponse(url=f"/admin?error=VPK校验失败", status_code=302)
-
-    stored = f"{sha256.hexdigest()}_{secrets.token_hex(4)}.vpk"
-    final_path = os.path.join(UPLOAD_DIR, stored)
-    shutil.move(tmp_path, final_path)
-
-    expires = None
-    if ttl_hours is not None and ttl_hours > 0:
-        expires = now_utc() + timedelta(hours=ttl_hours)
-
-    db = SessionLocal()
-    try:
-        up = Upload(
-            original_name=file.filename,
-            stored_name=stored,
-            sha256=sha256.hexdigest(),
-            size=read_bytes,
-            role="admin",
-            created_at=now_utc(),
-            expires_at=expires,
-            vpk_valid=True,
-            vpk_report=json.dumps(vr.to_dict(), ensure_ascii=False),
-            status="active",
-            uploader_ip=request.client.host if request.client else None,
-        )
-        db.add(up)
-        db.commit()
-        # Map processing (optional)
-        if process_map:
-            try:
-                report2 = process_map_vpk(final_path, UPLOAD_DIR)
-                rep = json.loads(up.vpk_report or "{}")
-                rep["map_process"] = report2
-                up.vpk_report = json.dumps(rep, ensure_ascii=False)
-                db.commit()
-            except Exception:
-                pass
-    finally:
-        db.close()
-
+    up, resp = await _handle_upload(request, file, role="admin", ttl_hours=ttl_hours)
+    if resp is not None:
+        return resp
     return RedirectResponse(url="/admin", status_code=302)
 
 @app.post("/admin/set_expiry/{item_id}")
@@ -302,34 +261,6 @@ async def admin_delete(request: Request, item_id: int):
     finally:
         db.close()
     return RedirectResponse(url="/admin", status_code=302)
-
-def _generated_paths(stored_name: str):
-    base = stored_name[:-4] if stored_name.lower().endswith(".vpk") else stored_name
-    client = os.path.join(UPLOAD_DIR, f"{base}_client.vpk")
-    server = os.path.join(UPLOAD_DIR, f"{base}_server.vpk")
-    return client, server
-
-@app.get("/g/{item_id}/{kind}")
-async def download_generated(item_id: int, kind: str):
-    db = SessionLocal()
-    try:
-        item = db.get(Upload, item_id)
-        if not item or item.status != "active":
-            raise HTTPException(status_code=404)
-        client_path, server_path = _generated_paths(item.stored_name)
-        if kind == "client":
-            path = client_path
-            fname = os.path.splitext(item.original_name)[0] + "_client.vpk"
-        elif kind == "server":
-            path = server_path
-            fname = os.path.splitext(item.original_name)[0] + "_server.vpk"
-        else:
-            raise HTTPException(status_code=400, detail="kind must be client/server")
-        if not os.path.exists(path):
-            raise HTTPException(status_code=404, detail="文件不存在")
-        return FileResponse(path, filename=fname, media_type="application/octet-stream")
-    finally:
-        db.close()
 
 @app.get("/detail/{item_id}", response_class=HTMLResponse)
 async def detail(request: Request, item_id: int):

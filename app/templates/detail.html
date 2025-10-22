@@ -7,18 +7,16 @@
   <p><strong>SHA256：</strong>{{ item.sha256 }}</p>
   <p><strong>状态：</strong>{{ item.status }} {% if item.expires_at %}（到期：{{ item.expires_at }}）{% else %}（永久）{% endif %}</p>
   <p>
-    <a class="btn" href="/d/{{ item.id }}/{{ item.original_name }}">下载（原文件）</a>
-    <a class="btn" href="/g/{{ item.id }}/server">下载（服务器版）</a>
-    <a class="btn" href="/g/{{ item.id }}/client">下载（客户端版）</a>
+    <a class="btn" href="/d/{{ item.id }}/{{ item.original_name }}">下载（服务器版）</a>
   </p>
   <details open>
     <summary>VPK 校验报告</summary>
-    <pre>{{ report | tojson }}</pre>
+    <pre>{{ report.validation | tojson }}</pre>
   </details>
-  {% if report.map_process %}
+  {% if report.server_build %}
   <details open>
-    <summary>地图处理报告</summary>
-    <pre>{{ report.map_process | tojson }}</pre>
+    <summary>服务器版构建报告</summary>
+    <pre>{{ report.server_build | tojson }}</pre>
   </details>
   {% endif %}
 </section>

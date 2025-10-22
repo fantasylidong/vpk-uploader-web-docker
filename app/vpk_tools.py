@@ -5,7 +5,6 @@
     from vpk import VPK
     from .thirdparty.l4d2_vpk_lib import NewVPK
 
-    # Whitelist for server build
     SERVER_KEEP_GLOBS = [
         "maps/*.bsp",
         "maps/*.nav",
@@ -15,11 +14,9 @@
         "maps/*.lmp",
         "maps/*.ain",
         "addoninfo.txt",
-        # If server logic needs vscripts, uncomment:
+        # 如果服务器需要 vscripts，可放开：
         # "scripts/vscripts/**",
     ]
-
-    CLIENT_TRIM_GLOBS: List[str] = []
 
     def _norm(p: str) -> str:
         return p.replace("\\\\", "/").lstrip("./")
@@ -30,20 +27,20 @@
         pattern = pattern.lower().replace("**", "*")
         return fnmatch.fnmatch(path, pattern)
 
-    def extract_vpk_to_dir(vpk_path: str, out_dir: str) -> List[str]:
+    def extract_vpk_to_dir(vpk_path: str, out_dir: str) -> int:
         os.makedirs(out_dir, exist_ok=True)
-        entries: List[str] = []
+        count = 0
         with VPK(vpk_path) as arch:
             for f in arch:
                 rel = _norm(f.filename)
-                entries.append(rel)
                 dst = os.path.join(out_dir, rel)
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 with open(dst, "wb") as w:
                     w.write(f.read())
-        return entries
+                count += 1
+        return count
 
-    def _filter_copy(in_dir: str, out_dir: str, keep_globs: List[str], trim_globs: List[str]=None) -> Tuple[int, int, List[str]]:
+    def _filter_copy(in_dir: str, out_dir: str, keep_globs: List[str]) -> Dict:
         os.makedirs(out_dir, exist_ok=True)
         kept = 0
         removed = 0
@@ -52,8 +49,6 @@
             for name in files:
                 rel = _norm(os.path.relpath(os.path.join(root, name), in_dir))
                 keep = any(_match_glob(rel, pat) for pat in keep_globs) if keep_globs else True
-                if trim_globs and any(_match_glob(rel, pat) for pat in trim_globs):
-                    keep = False
                 if keep:
                     dst = os.path.join(out_dir, rel)
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -62,7 +57,7 @@
                 else:
                     removed += 1
                     removed_list.append(rel)
-        return kept, removed, removed_list
+        return {"kept": kept, "removed": removed, "removed_list": removed_list[:200]}
 
     def build_vpk_from_dir(dir_path: str, dest_vpk_path: str):
         vp = NewVPK(dir_path)
@@ -72,36 +67,32 @@
             pass
         vp.save(dest_vpk_path)
 
-    def process_map_vpk(src_vpk_path: str, out_dir: str) -> Dict:
-        \"\"\"
-        Extract VPK, then build:
-          - client vpk: full contents (optionally trimmed by CLIENT_TRIM_GLOBS)
-          - server vpk: whitelist (SERVER_KEEP_GLOBS)
-        Returns stats & paths.
-        \"\"\"
-        work = os.path.join(out_dir, "work")
+    def process_server_vpk(src_vpk_path: str, output_dir: str, output_filename: str) -> Dict:
+        """
+        解包 -> 仅保留服务器需要的文件 -> 重打包为单一 VPK
+        返回：统计与目标文件路径
+        """
+        work = os.path.join(output_dir, "_work_" + os.path.splitext(output_filename)[0])
         ext_dir = os.path.join(work, "extracted")
-        client_dir = os.path.join(work, "client_dir")
         server_dir = os.path.join(work, "server_dir")
-        for d in [work, ext_dir, client_dir, server_dir]:
+        for d in [work, ext_dir, server_dir]:
             os.makedirs(d, exist_ok=True)
 
-        entries = extract_vpk_to_dir(src_vpk_path, ext_dir)
-        kept_c, removed_c, removed_list_c = _filter_copy(ext_dir, client_dir, keep_globs=[], trim_globs=CLIENT_TRIM_GLOBS or [])
-        kept_s, removed_s, removed_list_s = _filter_copy(ext_dir, server_dir, keep_globs=SERVER_KEEP_GLOBS, trim_globs=[])
+        total_entries = extract_vpk_to_dir(src_vpk_path, ext_dir)
+        stats = _filter_copy(ext_dir, server_dir, SERVER_KEEP_GLOBS)
 
-        base = os.path.splitext(os.path.basename(src_vpk_path))[0]
-        client_vpk = os.path.join(out_dir, f"{base}_client.vpk")
-        server_vpk = os.path.join(out_dir, f"{base}_server.vpk")
+        out_path = os.path.join(output_dir, output_filename)
+        build_vpk_from_dir(server_dir, out_path)
 
-        build_vpk_from_dir(client_dir, client_vpk)
-        build_vpk_from_dir(server_dir, server_vpk)
+        # 清理工作目录
+        try:
+            shutil.rmtree(work, ignore_errors=True)
+        except Exception:
+            pass
 
-        def _size(p: str) -> int:
-            return os.path.getsize(p) if os.path.exists(p) else 0
-
-        return {
-            "entries": len(entries),
-            "client": {"path": client_vpk, "kept": kept_c, "removed": removed_c, "size": _size(client_vpk), "removed_list": removed_list_c[:200],},
-            "server": {"path": server_vpk, "kept": kept_s, "removed": removed_s, "size": _size(server_vpk), "removed_list": removed_list_s[:200],},
+        res = {
+            "entries": total_entries,
+            "server": {"path": out_path, "kept": stats["kept"], "removed": stats["removed"], "removed_list": stats["removed_list"]},
+            "size": os.path.getsize(out_path) if os.path.exists(out_path) else 0,
         }
+        return res
