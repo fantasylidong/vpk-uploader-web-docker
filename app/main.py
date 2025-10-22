@@ -3,6 +3,8 @@ import hashlib
 import shutil
 import secrets
 import json
+import time
+from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -23,6 +25,10 @@ MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "1024"))
 DEFAULT_GUEST_TTL_HOURS = int(os.getenv("DEFAULT_GUEST_TTL_HOURS", "24"))
 RULES_FILE = os.getenv("RULES_FILE", "rules.yml")
 
+TMP_MAX_AGE_MIN = int(os.getenv("TMP_MAX_AGE_MIN", "30"))
+WORK_MAX_AGE_MIN = int(os.getenv("WORK_MAX_AGE_MIN", "60"))
+ORPHAN_KEEP_HOURS = int(os.getenv("ORPHAN_KEEP_HOURS", "12"))
+
 BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(os.path.dirname(BASE_DIR), "data")
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
@@ -42,6 +48,10 @@ init_db()
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+def _disposition_utf8(filename: str) -> str:
+    ascii_fallback = "".join(c if 32 <= ord(c) < 127 else "_" for c in filename)
+    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(filename)}"
+
 def cleanup_expired():
     db = SessionLocal()
     try:
@@ -60,9 +70,52 @@ def cleanup_expired():
     finally:
         db.close()
 
+def cleanup_tmp_and_work():
+    now = time.time()
+    # tmp
+    try:
+        for name in os.listdir(TMP_DIR):
+            path = os.path.join(TMP_DIR, name)
+            if os.path.isfile(path):
+                age = now - os.path.getmtime(path)
+                if age > TMP_MAX_AGE_MIN * 60:
+                    try: os.remove(path)
+                    except Exception: pass
+    except Exception:
+        pass
+    # _work_
+    try:
+        for name in os.listdir(UPLOAD_DIR):
+            if name.startswith("_work_"):
+                path = os.path.join(UPLOAD_DIR, name)
+                if os.path.isdir(path):
+                    age = now - os.path.getmtime(path)
+                    if age > WORK_MAX_AGE_MIN * 60:
+                        try: shutil.rmtree(path, ignore_errors=True)
+                        except Exception: pass
+    except Exception:
+        pass
+    # orphan vpk
+    try:
+        db = SessionLocal()
+        tracked = {row[0] for row in db.query(Upload.stored_name).all()}
+        db.close()
+        for name in os.listdir(UPLOAD_DIR):
+            if not name.endswith(".vpk") or name.startswith("_work_"):
+                continue
+            if name not in tracked:
+                path = os.path.join(UPLOAD_DIR, name)
+                age = now - os.path.getmtime(path)
+                if age > ORPHAN_KEEP_HOURS * 3600:
+                    try: os.remove(path)
+                    except Exception: pass
+    except Exception:
+        pass
+
 @app.middleware("http")
 async def tidy_mw(request: Request, call_next):
     cleanup_expired()
+    cleanup_tmp_and_work()
     response = await call_next(request)
     return response
 
@@ -76,8 +129,7 @@ def get_session(request: Request) -> dict:
         return {}
 
 def set_session(response, data: dict):
-    cookie = signer.dumps(data)
-    response.set_cookie("session", cookie, httponly=True, samesite="lax")
+    response.set_cookie("session", signer.dumps(data), httponly=True, samesite="lax")
 
 def clear_session(response):
     response.delete_cookie("session")
@@ -122,17 +174,15 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
     vr: ValidationResult = validate_vpk(tmp_path, RULES_FILE)
     if not vr.ok:
         os.remove(tmp_path)
-        return None, templates.TemplateResponse("index.html" if role=="guest" else "admin_dashboard.html", {
+        return None, templates.TemplateResponse("index.html", {
             "request": request,
             "max_mb": MAX_UPLOAD_MB,
             "guest_ttl_hours": DEFAULT_GUEST_TTL_HOURS,
             "error": "VPK 不符合要求",
             "report": vr.to_dict(),
-            "items": [] if role!="guest" else None,
-            "q": "" if role!="guest" else None
         })
 
-    # 仅保留服务器版：直接重打包为 _server.vpk，删除原文件
+    # 构建仅服务器版
     stored_base = f"{sha256.hexdigest()}_{secrets.token_hex(4)}"
     stored_name = f"{stored_base}_server.vpk"
     build_report = process_server_vpk(tmp_path, UPLOAD_DIR, stored_name)
@@ -141,7 +191,7 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
     except Exception:
         pass
 
-    # 记录数据库（以服务器版为最终存储）
+    # 入库
     db = SessionLocal()
     try:
         expires_at = None
@@ -278,8 +328,9 @@ async def detail(request: Request, item_id: int):
         "report": report
     })
 
-@app.get("/d/{item_id}/{name}")
-async def download(item_id: int, name: str):
+# 下载路由：只带 id，使用 RFC5987 处理中文文件名
+@app.get("/d/{item_id}")
+async def download(item_id: int):
     db = SessionLocal()
     try:
         item = db.get(Upload, item_id)
@@ -290,6 +341,7 @@ async def download(item_id: int, name: str):
         path = os.path.join(UPLOAD_DIR, item.stored_name)
         if not os.path.exists(path):
             raise HTTPException(status_code=404)
-        return FileResponse(path, filename=item.original_name, media_type="application/octet-stream")
+        headers = {"Content-Disposition": _disposition_utf8(item.original_name)}
+        return FileResponse(path, media_type="application/octet-stream", headers=headers)
     finally:
         db.close()

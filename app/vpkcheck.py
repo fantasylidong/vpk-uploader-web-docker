@@ -20,7 +20,7 @@ class ValidationResult:
         return asdict(self)
 
 def _norm(p: str) -> str:
-    return p.replace("\\", "/").lstrip("./").lower()
+    return p.replace("\", "/").lstrip("./").lower()
 
 def _load_rules(path: str) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -32,40 +32,29 @@ def validate_vpk(vpk_path: str, rules_path: str) -> ValidationResult:
     require_files = [s.lower() for s in rules.get("require_files", [])]
     block_globs = [s.lower() for s in rules.get("block_globs", [])]
     warn_globs = [s.lower() for s in rules.get("warn_globs", [])]
-    allow_exts = set([s.lower() for s in rules.get("allow_extensions", [])])
 
     size_mb = os.path.getsize(vpk_path) / (1024 * 1024)
 
-    # 迭代 VPK 得到的是路径字符串
     with VPK(vpk_path) as arch:
-        entries = [_norm(rel) for rel in arch]
+        entries = [_norm(rel) for rel in arch]  # 注意：返回的是路径字符串
 
     file_count = len(entries)
 
-    required_present = []
-    missing_required = []
+    required_present, missing_required = [], []
     lower_entries = set(entries)
     for req in require_files:
         hit = any(e.endswith("/" + req) or e == req for e in lower_entries)
-        if hit:
-            required_present.append(req)
-        else:
-            missing_required.append(req)
+        (required_present if hit else missing_required).append(req)
 
-    blocked_hits: List[str] = []
-    warned_hits: List[str] = []
+    blocked_hits, warned_hits = [], []
     for e in entries:
-        for pat in block_globs:
-            if fnmatch.fnmatch(e, pat):
-                blocked_hits.append(e)
-                break
-        for pat in warn_globs:
-            if fnmatch.fnmatch(e, pat):
-                warned_hits.append(e)
-                break
+        if any(fnmatch.fnmatch(e, pat) for pat in block_globs):
+            blocked_hits.append(e)
+            continue
+        if any(fnmatch.fnmatch(e, pat) for pat in warn_globs):
+            warned_hits.append(e)
 
     ok = size_mb <= max_size_mb and not missing_required and not blocked_hits
-    sample_files = entries[:20]
 
     return ValidationResult(
         ok=ok,
@@ -75,5 +64,5 @@ def validate_vpk(vpk_path: str, rules_path: str) -> ValidationResult:
         blocked_hits=blocked_hits[:50],
         warned_hits=warned_hits[:50],
         file_count=file_count,
-        sample_files=sample_files,
+        sample_files=entries[:20],
     )

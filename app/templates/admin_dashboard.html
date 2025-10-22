@@ -37,7 +37,7 @@
         <td>{% if it.expires_at %}{{ it.expires_at }}{% else %}<span class="tag">永久</span>{% endif %}</td>
         <td>{{ it.status }}</td>
         <td class="row">
-          <a class="btn" href="/d/{{ it.id }}/{{ it.original_name }}" target="_blank">下载</a>
+          <a class="btn" href="/d/{{ it.id }}" target="_blank">下载</a>
           <form action="/admin/set_expiry/{{ it.id }}" method="post">
             <input type="number" name="hours" min="0" placeholder="小时">
             <button>设定</button>
