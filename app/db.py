@@ -19,7 +19,7 @@ class Upload(Base):
     expires_at = Column(DateTime, nullable=True)
     vpk_valid = Column(Boolean, default=False)
     vpk_report = Column(Text, nullable=True)
-    status = Column(String(32), default="active")  # active/rejected/deleted
+    status = Column(String(32), default="active")
     uploader_ip = Column(String(64), nullable=True)
 
 def init_db():

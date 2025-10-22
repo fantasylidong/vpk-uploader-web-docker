@@ -19,7 +19,8 @@ class ValidationResult:
     def to_dict(self):
         return asdict(self)
 
-_def_norm = lambda p: p.replace("\\", "/").lstrip("./").lower()
+def _norm(p: str) -> str:
+    return p.replace("\\", "/").lstrip("./").lower()
 
 def _load_rules(path: str) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -38,7 +39,7 @@ def validate_vpk(vpk_path: str, rules_path: str) -> ValidationResult:
     with VPK(vpk_path) as arch:
         entries = []
         for f in arch:
-            entries.append(_def_norm(f.filename))
+            entries.append(_norm(f.filename))
 
     file_count = len(entries)
 
@@ -52,8 +53,8 @@ def validate_vpk(vpk_path: str, rules_path: str) -> ValidationResult:
         else:
             missing_required.append(req)
 
-    blocked_hits: List[str] = []
-    warned_hits: List[str] = []
+    blocked_hits = []
+    warned_hits = []
     for e in entries:
         for pat in block_globs:
             if fnmatch.fnmatch(e, pat):

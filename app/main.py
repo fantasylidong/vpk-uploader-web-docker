@@ -1,5 +1,4 @@
 import os
-import io
 import hashlib
 import shutil
 import secrets
@@ -14,6 +13,7 @@ from fastapi.templating import Jinja2Templates
 from itsdangerous import URLSafeSerializer, BadSignature
 
 from .vpkcheck import validate_vpk, ValidationResult
+from .vpk_tools import process_map_vpk
 from .db import init_db, SessionLocal, Upload
 
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret-change-me")
@@ -34,12 +34,9 @@ os.makedirs(TMP_DIR, exist_ok=True)
 app = FastAPI(title="VPK Uploader")
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
-
-# add a simple tojson filter for templates
 templates.env.filters['tojson'] = lambda v: json.dumps(v, ensure_ascii=False, indent=2)
 
 signer = URLSafeSerializer(APP_SECRET, salt="session")
-
 init_db()
 
 def now_utc() -> datetime:
@@ -205,7 +202,7 @@ async def admin_home(request: Request):
     })
 
 @app.post("/admin/upload")
-async def admin_upload(request: Request, file: UploadFile, ttl_hours: Optional[int] = Form(None)):
+async def admin_upload(request: Request, file: UploadFile, ttl_hours: Optional[int] = Form(None), process_map: Optional[int] = Form(None)):
     require_admin(request)
     if not file.filename.lower().endswith(".vpk"):
         raise HTTPException(status_code=400, detail="只允许上传 .vpk 文件")
@@ -260,6 +257,16 @@ async def admin_upload(request: Request, file: UploadFile, ttl_hours: Optional[i
         )
         db.add(up)
         db.commit()
+        # Map processing (optional)
+        if process_map:
+            try:
+                report2 = process_map_vpk(final_path, UPLOAD_DIR)
+                rep = json.loads(up.vpk_report or "{}")
+                rep["map_process"] = report2
+                up.vpk_report = json.dumps(rep, ensure_ascii=False)
+                db.commit()
+            except Exception:
+                pass
     finally:
         db.close()
 
@@ -295,6 +302,34 @@ async def admin_delete(request: Request, item_id: int):
     finally:
         db.close()
     return RedirectResponse(url="/admin", status_code=302)
+
+def _generated_paths(stored_name: str):
+    base = stored_name[:-4] if stored_name.lower().endswith(".vpk") else stored_name
+    client = os.path.join(UPLOAD_DIR, f"{base}_client.vpk")
+    server = os.path.join(UPLOAD_DIR, f"{base}_server.vpk")
+    return client, server
+
+@app.get("/g/{item_id}/{kind}")
+async def download_generated(item_id: int, kind: str):
+    db = SessionLocal()
+    try:
+        item = db.get(Upload, item_id)
+        if not item or item.status != "active":
+            raise HTTPException(status_code=404)
+        client_path, server_path = _generated_paths(item.stored_name)
+        if kind == "client":
+            path = client_path
+            fname = os.path.splitext(item.original_name)[0] + "_client.vpk"
+        elif kind == "server":
+            path = server_path
+            fname = os.path.splitext(item.original_name)[0] + "_server.vpk"
+        else:
+            raise HTTPException(status_code=400, detail="kind must be client/server")
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail="文件不存在")
+        return FileResponse(path, filename=fname, media_type="application/octet-stream")
+    finally:
+        db.close()
 
 @app.get("/detail/{item_id}", response_class=HTMLResponse)
 async def detail(request: Request, item_id: int):

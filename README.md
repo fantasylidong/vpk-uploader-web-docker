@@ -1,69 +1,26 @@
-# VPK Uploader (Docker + GitHub Actions → Docker Hub)
+# VPK Uploader (w/ Map Processing)
+- 仅允许 `.vpk` 上传，先校验合规
+- 管理员上传时可勾选“生成 `_server` / `_client`”，对地图 VPK 进行：
+  - 解包 → 服务器版白名单打包（仅保留 `maps/*.bsp/nav/txt/cfg/kv/lmp/ain`、`addoninfo.txt` 等）
+  - 解包 → 客户端版完整打包（可按需在 `app/vpk_tools.py` 的 `CLIENT_TRIM_GLOBS` 添加裁剪）
+  - 生成文件位于数据目录 `/app/data/uploads`，命名为 `<sha>_<rand>_server.vpk` / `_client.vpk`
+  - 详情页可直接下载“服务器版/客户端版”，并显示“地图处理报告”
 
-一个支持 **.vpk 文件上传**、**到期自动删除**、**管理员面板**、**VPK 内容校验** 的轻量级网站。
-- 普通用户：文件**固定 24 小时**后自动删除（可配环境变量）
-- 管理员：可自定义有效期（小时）或永久
-- 仅允许 `.vpk`，上传前**解析并校验**（基于 `rules.yml`）
-
-## 一、快速启动（本地构建）
+## 快速开始（本地构建）
 ```bash
 docker compose up -d --build
-# 访问 http://localhost:8080
+# http://localhost:8080
 ```
 
-## 二、从 Docker Hub 直接运行（拉镜像）
-假设镜像名是 `yourdockerhubname/vpk-uploader:latest`（把 `yourdockerhubname` 换成你自己的 Docker Hub 用户名）。
+## GitHub Actions → Docker Hub
+设置仓库 Secrets：`DOCKERHUB_USERNAME`、`DOCKERHUB_TOKEN`，推到 `main` 或打 tag 自动推送多架构镜像。
 
-### 方式 A：docker run
+## 从 Docker Hub 运行
 ```bash
-mkdir -p /opt/vpk-uploader/data
-# 可选：把本地 rules.yml 放到 /opt/vpk-uploader/rules.yml
-
-docker run -d       --name vpk-uploader       -p 8080:8080       -e APP_SECRET="please-change-to-a-long-random-string"       -e ADMIN_USER="admin"       -e ADMIN_PASS="admin123"       -e MAX_UPLOAD_MB=1024       -e DEFAULT_GUEST_TTL_HOURS=24       -e TZ=Asia/Shanghai       -v /opt/vpk-uploader/data:/app/data       -v /opt/vpk-uploader/rules.yml:/app/rules.yml:ro       yourdockerhubname/vpk-uploader:latest
+docker run -d       --name vpk-uploader       -p 8080:8080       -e APP_SECRET="change-me"       -e ADMIN_USER="admin"       -e ADMIN_PASS="admin123"       -v /opt/vpk-uploader/data:/app/data       yourdockerhubname/vpk-uploader:latest
 ```
 
-### 方式 B：docker compose（拉镜像运行）
-```bash
-# 可选：.env 内容如下（示例）
-# DOCKER_IMAGE=yourdockerhubname/vpk-uploader:latest
-# APP_SECRET=please-change-to-a-long-random-string
-# ADMIN_USER=admin
-# ADMIN_PASS=admin123
-# MAX_UPLOAD_MB=1024
-# DEFAULT_GUEST_TTL_HOURS=24
-# TZ=Asia/Shanghai
-
-docker compose -f docker-compose.pull.yml up -d
-```
-
-## 三、GitHub Actions → Docker Hub
-1) 在 GitHub 仓库的 **Settings → Secrets and variables → Actions** 添加：  
-   - `DOCKERHUB_USERNAME`：Docker Hub 用户名  
-   - `DOCKERHUB_TOKEN`：Docker Hub Access Token（在 Docker Hub 创建）
-2) 推送到 `main` 或打 tag（如 `v1.0.0`）：
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
-自动进行 **多架构**（amd64/arm64）构建并推送到：
-`docker.io/<DOCKERHUB_USERNAME>/vpk-uploader`
-
-## 四、环境变量
-- `APP_SECRET`：加密 Cookie 的密钥（必须换成随机长串）
-- `ADMIN_USER` / `ADMIN_PASS`：管理员帐密
-- `MAX_UPLOAD_MB`：单文件大小上限，默认 `1024`
-- `DEFAULT_GUEST_TTL_HOURS`：公共上传保留小时数，默认 `24`
-- `RULES_FILE`：规则文件路径（默认 `rules.yml`）
-- `TZ`：时区
-
-## 五、规则（rules.yml）
-- `max_size_mb`：VPK 最大体积（MB）
-- `require_files`：必须包含的文件（如 `addoninfo.txt`）
-- `block_globs`：命中即拒绝的路径/通配符
-- `warn_globs`：仅警告（在详情页报告展示）
-- `allow_extensions`：允许的扩展名（为空则不限制，仅用于报告）
-
-## 六、数据目录
-- `./data/uploads`：已接收的 VPK 文件
-- `./data/uploader.sqlite3`：数据库
-- `./data/tmp`：上传临时文件
+## 可调参数
+- 服务器白名单：`app/vpk_tools.py` → `SERVER_KEEP_GLOBS`
+- 客户端裁剪：`app/vpk_tools.py` → `CLIENT_TRIM_GLOBS`
+- 合规规则：`rules.yml`

@@ -6,10 +6,20 @@
   <p><strong>大小：</strong>{{ ('%.2f' % (item.size/1024/1024)) }} MB</p>
   <p><strong>SHA256：</strong>{{ item.sha256 }}</p>
   <p><strong>状态：</strong>{{ item.status }} {% if item.expires_at %}（到期：{{ item.expires_at }}）{% else %}（永久）{% endif %}</p>
-  <p><a class="btn" href="/d/{{ item.id }}/{{ item.original_name }}">下载</a></p>
+  <p>
+    <a class="btn" href="/d/{{ item.id }}/{{ item.original_name }}">下载（原文件）</a>
+    <a class="btn" href="/g/{{ item.id }}/server">下载（服务器版）</a>
+    <a class="btn" href="/g/{{ item.id }}/client">下载（客户端版）</a>
+  </p>
   <details open>
     <summary>VPK 校验报告</summary>
     <pre>{{ report | tojson }}</pre>
   </details>
+  {% if report.map_process %}
+  <details open>
+    <summary>地图处理报告</summary>
+    <pre>{{ report.map_process | tojson }}</pre>
+  </details>
+  {% endif %}
 </section>
 {% endblock %}
