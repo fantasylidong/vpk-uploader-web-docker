@@ -20,7 +20,7 @@ class ValidationResult:
         return asdict(self)
 
 def _norm(p: str) -> str:
-    return p.replace("\", "/").lstrip("./").lower()
+    return p.replace("\\", "/").lstrip("./").lower()
 
 def _load_rules(path: str) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
