@@ -34,12 +34,11 @@ def validate_vpk(vpk_path: str, rules_path: str) -> ValidationResult:
     warn_globs = [s.lower() for s in rules.get("warn_globs", [])]
     allow_exts = set([s.lower() for s in rules.get("allow_extensions", [])])
 
-    size_mb = os.path.getsize(vpk_path) / (1024*1024)
+    size_mb = os.path.getsize(vpk_path) / (1024 * 1024)
 
+    # 迭代 VPK 得到的是路径字符串
     with VPK(vpk_path) as arch:
-        entries = []
-        for f in arch:
-            entries.append(_norm(f.filename))
+        entries = [_norm(rel) for rel in arch]
 
     file_count = len(entries)
 
@@ -47,14 +46,14 @@ def validate_vpk(vpk_path: str, rules_path: str) -> ValidationResult:
     missing_required = []
     lower_entries = set(entries)
     for req in require_files:
-        hit = any(e.endswith("/"+req) or e == req for e in lower_entries)
+        hit = any(e.endswith("/" + req) or e == req for e in lower_entries)
         if hit:
             required_present.append(req)
         else:
             missing_required.append(req)
 
-    blocked_hits = []
-    warned_hits = []
+    blocked_hits: List[str] = []
+    warned_hits: List[str] = []
     for e in entries:
         for pat in block_globs:
             if fnmatch.fnmatch(e, pat):

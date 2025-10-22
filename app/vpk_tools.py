@@ -32,12 +32,14 @@ def extract_vpk_to_dir(vpk_path: str, out_dir: str) -> int:
     os.makedirs(out_dir, exist_ok=True)
     count = 0
     with VPK(vpk_path) as arch:
-        for f in arch:
-            rel = _norm(f.filename)
-            dst = os.path.join(out_dir, rel)
+        # 这里 arch 迭代得到的是字符串路径
+        for rel in arch:
+            norm_rel = _norm(rel)
+            dst = os.path.join(out_dir, norm_rel)
             os.makedirs(os.path.dirname(dst), exist_ok=True)
+            data = arch.get_file(rel).read()  # 正确读取文件内容
             with open(dst, "wb") as w:
-                w.write(f.read())
+                w.write(data)
             count += 1
     return count
 
