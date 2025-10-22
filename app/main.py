@@ -33,7 +33,9 @@ ORPHAN_KEEP_HOURS = int(os.getenv("ORPHAN_KEEP_HOURS", "12"))
 BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(os.path.dirname(BASE_DIR), "data")
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
-TMP_DIR = os.path.join(DATA_DIR, "tmp")
+
+# 重要：上传文件与工作目录在系统 /tmp
+TMP_DIR = os.getenv("TMP_DIR", "/tmp")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(TMP_DIR, exist_ok=True)
@@ -48,16 +50,10 @@ init_db()
 
 
 def now_utc() -> datetime:
-    """返回带 tzinfo 的 UTC 时间"""
     return datetime.now(timezone.utc)
 
 
 def _as_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
-    """
-    将数据库取出的 datetime 转成带 tzinfo 的 UTC。
-    - 如果是 naive（没 tzinfo），按 UTC 补齐 tzinfo。
-    - 如果已有 tzinfo，则转为 UTC。
-    """
     if dt is None:
         return None
     if dt.tzinfo is None:
@@ -66,20 +62,36 @@ def _as_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
 
 
 def _disposition_utf8(filename: str) -> str:
-    """
-    RFC 5987 格式的 Content-Disposition，兼容中文/空格/特殊字符。
-    """
     ascii_fallback = "".join(c if 32 <= ord(c) < 127 else "_" for c in filename)
-    # filename：ASCII 退化；filename*：UTF-8 百分号编码（包含空格会编码为 %20）
     return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(filename)}"
 
 
+def _basename_only(filename: str) -> str:
+    """取纯文件名（去路径），并禁止目录穿越。"""
+    base = os.path.basename(filename)
+    return base.replace("/", "").replace("\\", "")
+
+
+def _ensure_single_dot_vpk(filename: str):
+    """上传名只能有一个点，且扩展名必须是 .vpk"""
+    base = _basename_only(filename)
+    if base.count(".") != 1 or not base.lower().endswith(".vpk"):
+        raise HTTPException(status_code=400, detail="文件名非法：只能包含一个点且必须以 .vpk 结尾")
+    return base
+
+
+def _safe_base_no_ext(filename: str) -> str:
+    """基于原始上传名生成工作目录名（不含扩展名），保留中文与空格，移除斜杠。"""
+    base = _ensure_single_dot_vpk(filename)
+    name_no_ext = os.path.splitext(base)[0]
+    name_no_ext = name_no_ext.strip().replace("/", "").replace("\\", "")
+    return name_no_ext or "upload"
+
+
 def cleanup_expired():
-    """删除已过期的上传文件并将状态置为 deleted。"""
     db = SessionLocal()
     try:
         utcnow = now_utc()
-        # 先取候选，再用 Python 端做安全比较（避免 naive/aware 冲突）
         candidates = db.query(Upload).filter(
             Upload.expires_at.isnot(None),
             Upload.status == "active",
@@ -106,44 +118,30 @@ def cleanup_expired():
 
 
 def cleanup_tmp_and_work():
-    """定期清理临时文件、构建残留目录、无主 vpk。"""
     now_ts = time.time()
-    # tmp
+
+    # 清理 /tmp 中遗留的工作目录（/tmp/<原名>/...）
     try:
         for name in os.listdir(TMP_DIR):
-            path = os.path.join(TMP_DIR, name)
-            if os.path.isfile(path):
-                age = now_ts - os.path.getmtime(path)
-                if age > TMP_MAX_AGE_MIN * 60:
+            p = os.path.join(TMP_DIR, name)
+            # 仅清理我们创建的工作目录痕迹：目录且最近未改动
+            if os.path.isdir(p):
+                age = now_ts - os.path.getmtime(p)
+                if age > WORK_MAX_AGE_MIN * 60:
                     try:
-                        os.remove(path)
+                        shutil.rmtree(p, ignore_errors=True)
                     except Exception:
                         pass
     except Exception:
         pass
 
-    # _work_
-    try:
-        for name in os.listdir(UPLOAD_DIR):
-            if name.startswith("_work_"):
-                path = os.path.join(UPLOAD_DIR, name)
-                if os.path.isdir(path):
-                    age = now_ts - os.path.getmtime(path)
-                    if age > WORK_MAX_AGE_MIN * 60:
-                        try:
-                            shutil.rmtree(path, ignore_errors=True)
-                        except Exception:
-                            pass
-    except Exception:
-        pass
-
-    # 无主 vpk（DB 不跟踪的文件）
+    # 清理 uploads 中“无主 vpk”
     try:
         db = SessionLocal()
         tracked = {row[0] for row in db.query(Upload.stored_name).all()}
         db.close()
         for name in os.listdir(UPLOAD_DIR):
-            if not name.endswith(".vpk") or name.startswith("_work_"):
+            if not name.endswith(".vpk"):
                 continue
             if name not in tracked:
                 path = os.path.join(UPLOAD_DIR, name)
@@ -159,7 +157,6 @@ def cleanup_tmp_and_work():
 
 @app.middleware("http")
 async def tidy_mw(request: Request, call_next):
-    # 每次请求顺手清理一次
     cleanup_expired()
     cleanup_tmp_and_work()
     response = await call_next(request)
@@ -199,17 +196,19 @@ async def index(request: Request):
 
 
 async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hours: Optional[int]):
-    if not file.filename.lower().endswith(".vpk"):
-        raise HTTPException(status_code=400, detail="只允许上传 .vpk 文件")
+    # 1) 文件名校验（只允许一个点且扩展名 .vpk）
+    original_name = _ensure_single_dot_vpk(file.filename)
+    work_base = _safe_base_no_ext(original_name)  # 工作目录名 = 原名去扩展名
+    final_name = f"{work_base}_server.vpk"        # 生成到 uploads 的最终文件名
 
+    # 2) 上传流写入系统 /tmp
     max_bytes = MAX_UPLOAD_MB * 1024 * 1024
-    tmp_name = f"tmp_{secrets.token_hex(8)}.vpk"
-    tmp_path = os.path.join(TMP_DIR, tmp_name)
+    tmp_vpk_path = os.path.join(TMP_DIR, f"{secrets.token_hex(6)}.vpk")
 
     read_bytes = 0
     sha256 = hashlib.sha256()
 
-    with open(tmp_path, "wb") as out:
+    with open(tmp_vpk_path, "wb") as out:
         while True:
             chunk = await file.read(1024 * 1024)
             if not chunk:
@@ -217,15 +216,18 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
             read_bytes += len(chunk)
             if read_bytes > max_bytes:
                 out.close()
-                os.remove(tmp_path)
+                os.remove(tmp_vpk_path)
                 raise HTTPException(status_code=400, detail=f"文件过大，超过 {MAX_UPLOAD_MB} MB 限制")
             sha256.update(chunk)
             out.write(chunk)
 
-    # 校验 VPK 合规
-    vr: ValidationResult = validate_vpk(tmp_path, RULES_FILE)
+    # 3) 合规校验
+    vr: ValidationResult = validate_vpk(tmp_vpk_path, RULES_FILE)
     if not vr.ok:
-        os.remove(tmp_path)
+        try:
+            os.remove(tmp_vpk_path)
+        except Exception:
+            pass
         return None, templates.TemplateResponse("index.html", {
             "request": request,
             "max_mb": MAX_UPLOAD_MB,
@@ -234,16 +236,16 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
             "report": vr.to_dict(),
         })
 
-    # 仅保留服务器版（解包→白名单→重打包）
-    stored_base = f"{sha256.hexdigest()}_{secrets.token_hex(4)}"
-    stored_name = f"{stored_base}_server.vpk"
-    build_report = process_server_vpk(tmp_path, UPLOAD_DIR, stored_name)
-    try:
-        os.remove(tmp_path)
-    except Exception:
-        pass
+    # 4) 仅服务器版：在 /tmp 下以“原名”做工作目录，解包后立刻删除原始 .vpk，再重打包到 uploads
+    build_report = process_server_vpk(
+        src_vpk_path=tmp_vpk_path,
+        work_dir_root=TMP_DIR,
+        work_base_name=work_base,
+        output_dir=UPLOAD_DIR,
+        output_filename=final_name,
+    )
 
-    # 入库
+    # 5) 入库
     db = SessionLocal()
     try:
         expires_at = None
@@ -253,10 +255,10 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
             if ttl_hours is not None and ttl_hours > 0:
                 expires_at = now_utc() + timedelta(hours=ttl_hours)
 
-        server_path = os.path.join(UPLOAD_DIR, stored_name)
+        server_path = os.path.join(UPLOAD_DIR, final_name)
         up = Upload(
-            original_name=file.filename,
-            stored_name=stored_name,
+            original_name=original_name,
+            stored_name=final_name,
             sha256=sha256.hexdigest(),
             size=os.path.getsize(server_path) if os.path.exists(server_path) else 0,
             role=role,
@@ -401,7 +403,6 @@ async def download(item_id: int):
         if not item or item.status != "active":
             raise HTTPException(status_code=404)
 
-        # 关键修复：统一转为 aware UTC 再比较
         exp = _as_aware_utc(item.expires_at)
         if exp and exp < now_utc():
             raise HTTPException(status_code=410, detail="文件已过期")
