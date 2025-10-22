@@ -25,6 +25,7 @@ MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "1024"))
 DEFAULT_GUEST_TTL_HOURS = int(os.getenv("DEFAULT_GUEST_TTL_HOURS", "24"))
 RULES_FILE = os.getenv("RULES_FILE", "rules.yml")
 
+# 清理策略（分钟/小时）
 TMP_MAX_AGE_MIN = int(os.getenv("TMP_MAX_AGE_MIN", "30"))
 WORK_MAX_AGE_MIN = int(os.getenv("WORK_MAX_AGE_MIN", "60"))
 ORPHAN_KEEP_HOURS = int(os.getenv("ORPHAN_KEEP_HOURS", "12"))
@@ -45,18 +46,50 @@ templates.env.filters['tojson'] = lambda v: json.dumps(v, ensure_ascii=False, in
 signer = URLSafeSerializer(APP_SECRET, salt="session")
 init_db()
 
+
 def now_utc() -> datetime:
+    """返回带 tzinfo 的 UTC 时间"""
     return datetime.now(timezone.utc)
 
+
+def _as_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """
+    将数据库取出的 datetime 转成带 tzinfo 的 UTC。
+    - 如果是 naive（没 tzinfo），按 UTC 补齐 tzinfo。
+    - 如果已有 tzinfo，则转为 UTC。
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _disposition_utf8(filename: str) -> str:
+    """
+    RFC 5987 格式的 Content-Disposition，兼容中文/空格/特殊字符。
+    """
     ascii_fallback = "".join(c if 32 <= ord(c) < 127 else "_" for c in filename)
+    # filename：ASCII 退化；filename*：UTF-8 百分号编码（包含空格会编码为 %20）
     return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(filename)}"
 
+
 def cleanup_expired():
+    """删除已过期的上传文件并将状态置为 deleted。"""
     db = SessionLocal()
     try:
         utcnow = now_utc()
-        expired = db.query(Upload).filter(Upload.expires_at.isnot(None), Upload.expires_at < utcnow, Upload.status == "active").all()
+        # 先取候选，再用 Python 端做安全比较（避免 naive/aware 冲突）
+        candidates = db.query(Upload).filter(
+            Upload.expires_at.isnot(None),
+            Upload.status == "active",
+        ).all()
+
+        expired = [
+            u for u in candidates
+            if (_as_aware_utc(u.expires_at) and _as_aware_utc(u.expires_at) < utcnow)
+        ]
+
         for u in expired:
             try:
                 path = os.path.join(UPLOAD_DIR, u.stored_name)
@@ -65,37 +98,46 @@ def cleanup_expired():
             except Exception:
                 pass
             u.status = "deleted"
+
         if expired:
             db.commit()
     finally:
         db.close()
 
+
 def cleanup_tmp_and_work():
-    now = time.time()
+    """定期清理临时文件、构建残留目录、无主 vpk。"""
+    now_ts = time.time()
     # tmp
     try:
         for name in os.listdir(TMP_DIR):
             path = os.path.join(TMP_DIR, name)
             if os.path.isfile(path):
-                age = now - os.path.getmtime(path)
+                age = now_ts - os.path.getmtime(path)
                 if age > TMP_MAX_AGE_MIN * 60:
-                    try: os.remove(path)
-                    except Exception: pass
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
     except Exception:
         pass
+
     # _work_
     try:
         for name in os.listdir(UPLOAD_DIR):
             if name.startswith("_work_"):
                 path = os.path.join(UPLOAD_DIR, name)
                 if os.path.isdir(path):
-                    age = now - os.path.getmtime(path)
+                    age = now_ts - os.path.getmtime(path)
                     if age > WORK_MAX_AGE_MIN * 60:
-                        try: shutil.rmtree(path, ignore_errors=True)
-                        except Exception: pass
+                        try:
+                            shutil.rmtree(path, ignore_errors=True)
+                        except Exception:
+                            pass
     except Exception:
         pass
-    # orphan vpk
+
+    # 无主 vpk（DB 不跟踪的文件）
     try:
         db = SessionLocal()
         tracked = {row[0] for row in db.query(Upload.stored_name).all()}
@@ -105,19 +147,24 @@ def cleanup_tmp_and_work():
                 continue
             if name not in tracked:
                 path = os.path.join(UPLOAD_DIR, name)
-                age = now - os.path.getmtime(path)
+                age = now_ts - os.path.getmtime(path)
                 if age > ORPHAN_KEEP_HOURS * 3600:
-                    try: os.remove(path)
-                    except Exception: pass
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
     except Exception:
         pass
 
+
 @app.middleware("http")
 async def tidy_mw(request: Request, call_next):
+    # 每次请求顺手清理一次
     cleanup_expired()
     cleanup_tmp_and_work()
     response = await call_next(request)
     return response
+
 
 def get_session(request: Request) -> dict:
     cookie = request.cookies.get("session")
@@ -128,15 +175,19 @@ def get_session(request: Request) -> dict:
     except BadSignature:
         return {}
 
+
 def set_session(response, data: dict):
     response.set_cookie("session", signer.dumps(data), httponly=True, samesite="lax")
+
 
 def clear_session(response):
     response.delete_cookie("session")
 
+
 @app.get("/healthz", response_class=PlainTextResponse)
 def healthz():
     return "ok"
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -145,6 +196,7 @@ async def index(request: Request):
         "max_mb": MAX_UPLOAD_MB,
         "guest_ttl_hours": DEFAULT_GUEST_TTL_HOURS
     })
+
 
 async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hours: Optional[int]):
     if not file.filename.lower().endswith(".vpk"):
@@ -170,7 +222,7 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
             sha256.update(chunk)
             out.write(chunk)
 
-    # 校验 VPK
+    # 校验 VPK 合规
     vr: ValidationResult = validate_vpk(tmp_path, RULES_FILE)
     if not vr.ok:
         os.remove(tmp_path)
@@ -182,7 +234,7 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
             "report": vr.to_dict(),
         })
 
-    # 构建仅服务器版
+    # 仅保留服务器版（解包→白名单→重打包）
     stored_base = f"{sha256.hexdigest()}_{secrets.token_hex(4)}"
     stored_name = f"{stored_base}_server.vpk"
     build_report = process_server_vpk(tmp_path, UPLOAD_DIR, stored_name)
@@ -200,6 +252,7 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
         else:
             if ttl_hours is not None and ttl_hours > 0:
                 expires_at = now_utc() + timedelta(hours=ttl_hours)
+
         server_path = os.path.join(UPLOAD_DIR, stored_name)
         up = Upload(
             original_name=file.filename,
@@ -222,6 +275,7 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
 
     return up, None
 
+
 @app.post("/upload")
 async def guest_upload(request: Request, file: UploadFile):
     up, resp = await _handle_upload(request, file, role="guest", ttl_hours=None)
@@ -229,15 +283,18 @@ async def guest_upload(request: Request, file: UploadFile):
         return resp
     return RedirectResponse(url=f"/detail/{up.id}", status_code=302)
 
+
 def require_admin(request: Request):
     sess = get_session(request)
     if sess.get("role") == "admin":
         return True
     raise HTTPException(status_code=401, detail="需要管理员登录")
 
+
 @app.get("/admin/login", response_class=HTMLResponse)
 async def admin_login_page(request: Request):
     return templates.TemplateResponse("admin_login.html", {"request": request})
+
 
 @app.post("/admin/login")
 async def admin_login(request: Request, username: str = Form(...), password: str = Form(...)):
@@ -247,11 +304,13 @@ async def admin_login(request: Request, username: str = Form(...), password: str
         return resp
     return templates.TemplateResponse("admin_login.html", {"request": request, "error": "用户名或密码错误"})
 
+
 @app.get("/admin/logout")
 async def admin_logout(request: Request):
     resp = RedirectResponse(url="/admin/login", status_code=302)
     clear_session(resp)
     return resp
+
 
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_home(request: Request):
@@ -273,6 +332,7 @@ async def admin_home(request: Request):
         "max_mb": MAX_UPLOAD_MB
     })
 
+
 @app.post("/admin/upload")
 async def admin_upload(request: Request, file: UploadFile, ttl_hours: Optional[int] = Form(None)):
     require_admin(request)
@@ -280,6 +340,7 @@ async def admin_upload(request: Request, file: UploadFile, ttl_hours: Optional[i
     if resp is not None:
         return resp
     return RedirectResponse(url="/admin", status_code=302)
+
 
 @app.post("/admin/set_expiry/{item_id}")
 async def admin_set_expiry(request: Request, item_id: int, hours: int = Form(...)):
@@ -294,6 +355,7 @@ async def admin_set_expiry(request: Request, item_id: int, hours: int = Form(...
     finally:
         db.close()
     return RedirectResponse(url="/admin", status_code=302)
+
 
 @app.post("/admin/delete/{item_id}")
 async def admin_delete(request: Request, item_id: int):
@@ -312,6 +374,7 @@ async def admin_delete(request: Request, item_id: int):
         db.close()
     return RedirectResponse(url="/admin", status_code=302)
 
+
 @app.get("/detail/{item_id}", response_class=HTMLResponse)
 async def detail(request: Request, item_id: int):
     db = SessionLocal()
@@ -328,7 +391,8 @@ async def detail(request: Request, item_id: int):
         "report": report
     })
 
-# 下载路由：只带 id，使用 RFC5987 处理中文文件名
+
+# 下载：仅用 id，响应头用 RFC 5987 兼容中文和空格
 @app.get("/d/{item_id}")
 async def download(item_id: int):
     db = SessionLocal()
@@ -336,11 +400,16 @@ async def download(item_id: int):
         item = db.get(Upload, item_id)
         if not item or item.status != "active":
             raise HTTPException(status_code=404)
-        if item.expires_at and item.expires_at < now_utc():
+
+        # 关键修复：统一转为 aware UTC 再比较
+        exp = _as_aware_utc(item.expires_at)
+        if exp and exp < now_utc():
             raise HTTPException(status_code=410, detail="文件已过期")
+
         path = os.path.join(UPLOAD_DIR, item.stored_name)
         if not os.path.exists(path):
             raise HTTPException(status_code=404)
+
         headers = {"Content-Disposition": _disposition_utf8(item.original_name)}
         return FileResponse(path, media_type="application/octet-stream", headers=headers)
     finally:
