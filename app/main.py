@@ -16,13 +16,14 @@ from itsdangerous import URLSafeSerializer, BadSignature
 
 from .vpkcheck import validate_vpk, ValidationResult
 from .vpk_tools import process_server_vpk
-from .db import init_db, SessionLocal, Upload
+from .db import init_db, SessionLocal, Upload, AppSetting
 
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret-change-me")
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "1024"))
 DEFAULT_GUEST_TTL_HOURS = int(os.getenv("DEFAULT_GUEST_TTL_HOURS", "24"))
+GUEST_TTL_SETTING_KEY = "guest_ttl_hours"
 RULES_FILE = os.getenv("RULES_FILE", "rules.yml")
 
 # 清理策略（分钟/小时）
@@ -64,6 +65,48 @@ def _as_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
 def _disposition_utf8(filename: str) -> str:
     ascii_fallback = "".join(c if 32 <= ord(c) < 127 else "_" for c in filename)
     return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(filename)}"
+
+
+def _normalize_hours(hours: int) -> int:
+    return max(0, int(hours))
+
+
+def guest_ttl_label(hours: int) -> str:
+    hours = _normalize_hours(hours)
+    if hours == 0:
+        return "永久保存"
+    return f"自动保留 {hours} 小时"
+
+
+def get_guest_ttl_hours(db=None) -> int:
+    own_db = db is None
+    if own_db:
+        db = SessionLocal()
+    try:
+        setting = db.get(AppSetting, GUEST_TTL_SETTING_KEY)
+        if not setting:
+            return _normalize_hours(DEFAULT_GUEST_TTL_HOURS)
+        return _normalize_hours(setting.value)
+    except (TypeError, ValueError):
+        return _normalize_hours(DEFAULT_GUEST_TTL_HOURS)
+    finally:
+        if own_db:
+            db.close()
+
+
+def set_guest_ttl_hours(hours: int) -> None:
+    hours = _normalize_hours(hours)
+    db = SessionLocal()
+    try:
+        setting = db.get(AppSetting, GUEST_TTL_SETTING_KEY)
+        if setting:
+            setting.value = str(hours)
+        else:
+            setting = AppSetting(key=GUEST_TTL_SETTING_KEY, value=str(hours))
+            db.add(setting)
+        db.commit()
+    finally:
+        db.close()
 
 
 def _basename_only(filename: str) -> str:
@@ -188,10 +231,12 @@ def healthz():
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
+    guest_ttl_hours = get_guest_ttl_hours()
     return templates.TemplateResponse("index.html", {
         "request": request,
         "max_mb": MAX_UPLOAD_MB,
-        "guest_ttl_hours": DEFAULT_GUEST_TTL_HOURS
+        "guest_ttl_hours": guest_ttl_hours,
+        "guest_ttl_label": guest_ttl_label(guest_ttl_hours),
     })
 
 
@@ -224,6 +269,7 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
     # 3) 合规校验
     vr: ValidationResult = validate_vpk(tmp_vpk_path, RULES_FILE)
     if not vr.ok:
+        guest_ttl_hours = get_guest_ttl_hours()
         try:
             os.remove(tmp_vpk_path)
         except Exception:
@@ -231,7 +277,8 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
         return None, templates.TemplateResponse("index.html", {
             "request": request,
             "max_mb": MAX_UPLOAD_MB,
-            "guest_ttl_hours": DEFAULT_GUEST_TTL_HOURS,
+            "guest_ttl_hours": guest_ttl_hours,
+            "guest_ttl_label": guest_ttl_label(guest_ttl_hours),
             "error": "VPK 不符合要求",
             "report": vr.to_dict(),
         })
@@ -250,7 +297,9 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
     try:
         expires_at = None
         if role == "guest":
-            expires_at = now_utc() + timedelta(hours=DEFAULT_GUEST_TTL_HOURS)
+            guest_ttl_hours = get_guest_ttl_hours(db)
+            if guest_ttl_hours > 0:
+                expires_at = now_utc() + timedelta(hours=guest_ttl_hours)
         else:
             if ttl_hours is not None and ttl_hours > 0:
                 expires_at = now_utc() + timedelta(hours=ttl_hours)
@@ -318,8 +367,10 @@ async def admin_logout(request: Request):
 async def admin_home(request: Request):
     require_admin(request)
     q = request.query_params.get("q")
+    settings_saved = request.query_params.get("settings_saved") == "1"
     db = SessionLocal()
     try:
+        guest_ttl_hours = get_guest_ttl_hours(db)
         query = db.query(Upload).order_by(Upload.created_at.desc())
         if q:
             like = f"%{q}%"
@@ -331,8 +382,20 @@ async def admin_home(request: Request):
         "request": request,
         "items": items,
         "q": q or "",
-        "max_mb": MAX_UPLOAD_MB
+        "max_mb": MAX_UPLOAD_MB,
+        "guest_ttl_hours": guest_ttl_hours,
+        "guest_ttl_label": guest_ttl_label(guest_ttl_hours),
+        "settings_saved": settings_saved,
     })
+
+
+@app.post("/admin/settings/guest-ttl")
+async def admin_set_guest_ttl(request: Request, guest_ttl_hours: int = Form(...)):
+    require_admin(request)
+    if guest_ttl_hours < 0:
+        raise HTTPException(status_code=400, detail="普通用户保存时间不能小于 0 小时")
+    set_guest_ttl_hours(guest_ttl_hours)
+    return RedirectResponse(url="/admin?settings_saved=1", status_code=302)
 
 
 @app.post("/admin/upload")

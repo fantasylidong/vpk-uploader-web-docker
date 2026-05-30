@@ -22,5 +22,12 @@ class Upload(Base):
     status = Column(String(32), default="active")
     uploader_ip = Column(String(64), nullable=True)
 
+
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+    key = Column(String(128), primary_key=True, index=True)
+    value = Column(String(1024), nullable=False)
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
