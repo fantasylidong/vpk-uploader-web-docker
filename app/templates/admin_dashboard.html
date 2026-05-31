@@ -3,14 +3,20 @@
 <section class="card">
   <h2>管理员面板</h2>
   <form action="/admin/settings/guest-ttl" method="post" class="row settings-form">
-    <label>普通用户上传保存时间（小时，0=永久）
+    <label>普通用户保存时间（小时，0=永久）
       <input type="number" min="0" name="guest_ttl_hours" value="{{ guest_ttl_hours }}" required>
     </label>
+    <label>上传总容量（MB，0=不限）
+      <input type="number" min="0" name="total_upload_limit_mb" value="{{ total_upload_limit_mb }}" required>
+    </label>
     <button type="submit">保存设置</button>
-    <span class="muted">当前：{{ guest_ttl_label }}</span>
+    <span class="muted">保存时间：{{ guest_ttl_label }}；容量：{{ total_upload_usage_label }}</span>
   </form>
   {% if settings_saved %}
-    <div class="success">普通用户上传保存时间已更新</div>
+    <div class="success">设置已更新</div>
+  {% endif %}
+  {% if upload_error %}
+    <div class="error">{{ upload_error }}</div>
   {% endif %}
 
   <form action="/admin/upload" method="post" enctype="multipart/form-data" class="row upload-form">

@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, Plai
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from itsdangerous import URLSafeSerializer, BadSignature
+from vpk import VPK
 
 from .vpkcheck import validate_vpk, ValidationResult
 from .vpk_tools import process_server_vpk
@@ -22,7 +23,9 @@ APP_SECRET = os.getenv("APP_SECRET", "dev-secret-change-me")
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "1024"))
+DEFAULT_TOTAL_UPLOAD_LIMIT_MB = int(os.getenv("MAX_TOTAL_UPLOAD_MB", "0"))
 DEFAULT_GUEST_TTL_HOURS = int(os.getenv("DEFAULT_GUEST_TTL_HOURS", "24"))
+TOTAL_UPLOAD_LIMIT_SETTING_KEY = "total_upload_limit_mb"
 GUEST_TTL_SETTING_KEY = "guest_ttl_hours"
 RULES_FILE = os.getenv("RULES_FILE", "rules.yml")
 
@@ -71,6 +74,14 @@ def _normalize_hours(hours: int) -> int:
     return max(0, int(hours))
 
 
+def _normalize_mb(mb: int) -> int:
+    return max(0, int(mb))
+
+
+def _format_mb(byte_count: int) -> str:
+    return f"{byte_count / 1024 / 1024:.2f} MB"
+
+
 def guest_ttl_label(hours: int) -> str:
     hours = _normalize_hours(hours)
     if hours == 0:
@@ -78,35 +89,171 @@ def guest_ttl_label(hours: int) -> str:
     return f"自动保留 {hours} 小时"
 
 
+def total_upload_limit_label(limit_mb: int) -> str:
+    limit_mb = _normalize_mb(limit_mb)
+    if limit_mb == 0:
+        return "不限"
+    return f"{limit_mb} MB"
+
+
+def _get_int_setting(db, key: str, default_value: int, normalizer) -> int:
+    try:
+        setting = db.get(AppSetting, key)
+        if not setting:
+            return normalizer(default_value)
+        return normalizer(setting.value)
+    except (TypeError, ValueError):
+        return normalizer(default_value)
+
+
+def _set_int_setting(key: str, value: int, normalizer) -> None:
+    value = normalizer(value)
+    db = SessionLocal()
+    try:
+        setting = db.get(AppSetting, key)
+        if setting:
+            setting.value = str(value)
+        else:
+            setting = AppSetting(key=key, value=str(value))
+            db.add(setting)
+        db.commit()
+    finally:
+        db.close()
+
+
 def get_guest_ttl_hours(db=None) -> int:
     own_db = db is None
     if own_db:
         db = SessionLocal()
     try:
-        setting = db.get(AppSetting, GUEST_TTL_SETTING_KEY)
-        if not setting:
-            return _normalize_hours(DEFAULT_GUEST_TTL_HOURS)
-        return _normalize_hours(setting.value)
-    except (TypeError, ValueError):
-        return _normalize_hours(DEFAULT_GUEST_TTL_HOURS)
+        return _get_int_setting(db, GUEST_TTL_SETTING_KEY, DEFAULT_GUEST_TTL_HOURS, _normalize_hours)
     finally:
         if own_db:
             db.close()
 
 
 def set_guest_ttl_hours(hours: int) -> None:
-    hours = _normalize_hours(hours)
+    _set_int_setting(GUEST_TTL_SETTING_KEY, hours, _normalize_hours)
+
+
+def get_total_upload_limit_mb(db=None) -> int:
+    own_db = db is None
+    if own_db:
+        db = SessionLocal()
+    try:
+        return _get_int_setting(db, TOTAL_UPLOAD_LIMIT_SETTING_KEY, DEFAULT_TOTAL_UPLOAD_LIMIT_MB, _normalize_mb)
+    finally:
+        if own_db:
+            db.close()
+
+
+def set_total_upload_limit_mb(limit_mb: int) -> None:
+    _set_int_setting(TOTAL_UPLOAD_LIMIT_SETTING_KEY, limit_mb, _normalize_mb)
+
+
+def active_upload_usage_bytes(db) -> int:
+    rows = db.query(Upload.size).filter(Upload.status == "active").all()
+    return sum((size or 0) for (size,) in rows)
+
+
+def storage_context(db) -> dict:
+    used_bytes = active_upload_usage_bytes(db)
+    limit_mb = get_total_upload_limit_mb(db)
+    limit_bytes = limit_mb * 1024 * 1024
+    usage_percent = 0
+    remaining_bytes = None
+
+    if limit_bytes > 0:
+        usage_percent = min(100, round(used_bytes / limit_bytes * 100, 1))
+        remaining_bytes = max(0, limit_bytes - used_bytes)
+
+    usage_label = f"已用 {_format_mb(used_bytes)} / {total_upload_limit_label(limit_mb)}"
+    if remaining_bytes is not None:
+        usage_label = f"{usage_label}，剩余 {_format_mb(remaining_bytes)}"
+
+    return {
+        "total_upload_limit_mb": limit_mb,
+        "total_upload_limit_label": total_upload_limit_label(limit_mb),
+        "total_upload_limit_bytes": limit_bytes,
+        "total_upload_used_bytes": used_bytes,
+        "total_upload_used_label": _format_mb(used_bytes),
+        "total_upload_usage_label": usage_label,
+        "total_upload_usage_percent": usage_percent,
+    }
+
+
+def index_context(request: Request, error: Optional[str] = None, report=None) -> dict:
     db = SessionLocal()
     try:
-        setting = db.get(AppSetting, GUEST_TTL_SETTING_KEY)
-        if setting:
-            setting.value = str(hours)
-        else:
-            setting = AppSetting(key=GUEST_TTL_SETTING_KEY, value=str(hours))
-            db.add(setting)
-        db.commit()
+        guest_ttl_hours = get_guest_ttl_hours(db)
+        context = {
+            "request": request,
+            "max_mb": MAX_UPLOAD_MB,
+            "guest_ttl_hours": guest_ttl_hours,
+            "guest_ttl_label": guest_ttl_label(guest_ttl_hours),
+            "error": error,
+            "report": report,
+        }
+        context.update(storage_context(db))
+        return context
     finally:
         db.close()
+
+
+def admin_context(
+    request: Request,
+    q: Optional[str] = None,
+    settings_saved: bool = False,
+    upload_error: Optional[str] = None,
+) -> dict:
+    db = SessionLocal()
+    try:
+        guest_ttl_hours = get_guest_ttl_hours(db)
+        query = db.query(Upload).order_by(Upload.created_at.desc())
+        if q:
+            like = f"%{q}%"
+            query = query.filter(Upload.original_name.like(like))
+        items = query.limit(200).all()
+        context = {
+            "request": request,
+            "items": items,
+            "q": q or "",
+            "max_mb": MAX_UPLOAD_MB,
+            "guest_ttl_hours": guest_ttl_hours,
+            "guest_ttl_label": guest_ttl_label(guest_ttl_hours),
+            "settings_saved": settings_saved,
+            "upload_error": upload_error,
+        }
+        context.update(storage_context(db))
+        return context
+    finally:
+        db.close()
+
+
+def upload_error_response(request: Request, role: str, message: str, report=None):
+    if role == "admin":
+        return templates.TemplateResponse("admin_dashboard.html", admin_context(request, upload_error=message))
+    return templates.TemplateResponse("index.html", index_context(request, error=message, report=report))
+
+
+def total_capacity_error(db, new_file_size: int) -> Optional[str]:
+    limit_mb = get_total_upload_limit_mb(db)
+    if limit_mb <= 0:
+        return None
+
+    limit_bytes = limit_mb * 1024 * 1024
+    used_bytes = active_upload_usage_bytes(db)
+    if used_bytes + new_file_size <= limit_bytes:
+        return None
+
+    remaining_bytes = max(0, limit_bytes - used_bytes)
+    return (
+        "上传失败：已超过上传总容量限制。"
+        f"总容量上限 {total_upload_limit_label(limit_mb)}，"
+        f"当前已用 {_format_mb(used_bytes)}，"
+        f"剩余 {_format_mb(remaining_bytes)}，"
+        f"本次生成文件 {_format_mb(new_file_size)}。"
+    )
 
 
 def _basename_only(filename: str) -> str:
@@ -231,13 +378,7 @@ def healthz():
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    guest_ttl_hours = get_guest_ttl_hours()
-    return templates.TemplateResponse("index.html", {
-        "request": request,
-        "max_mb": MAX_UPLOAD_MB,
-        "guest_ttl_hours": guest_ttl_hours,
-        "guest_ttl_label": guest_ttl_label(guest_ttl_hours),
-    })
+    return templates.TemplateResponse("index.html", index_context(request))
 
 
 async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hours: Optional[int]):
@@ -269,19 +410,11 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
     # 3) 合规校验
     vr: ValidationResult = validate_vpk(tmp_vpk_path, RULES_FILE)
     if not vr.ok:
-        guest_ttl_hours = get_guest_ttl_hours()
         try:
             os.remove(tmp_vpk_path)
         except Exception:
             pass
-        return None, templates.TemplateResponse("index.html", {
-            "request": request,
-            "max_mb": MAX_UPLOAD_MB,
-            "guest_ttl_hours": guest_ttl_hours,
-            "guest_ttl_label": guest_ttl_label(guest_ttl_hours),
-            "error": "VPK 不符合要求",
-            "report": vr.to_dict(),
-        })
+        return None, upload_error_response(request, role, "VPK 不符合要求", report=vr.to_dict())
 
     # 4) 仅服务器版：在 /tmp 下以“原名”做工作目录，解包后立刻删除原始 .vpk，再重打包到 uploads
     build_report = process_server_vpk(
@@ -305,11 +438,20 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
                 expires_at = now_utc() + timedelta(hours=ttl_hours)
 
         server_path = os.path.join(UPLOAD_DIR, final_name)
+        server_size = os.path.getsize(server_path) if os.path.exists(server_path) else 0
+        capacity_error = total_capacity_error(db, server_size)
+        if capacity_error:
+            try:
+                os.remove(server_path)
+            except Exception:
+                pass
+            return None, upload_error_response(request, role, capacity_error)
+
         up = Upload(
             original_name=original_name,
             stored_name=final_name,
             sha256=sha256.hexdigest(),
-            size=os.path.getsize(server_path) if os.path.exists(server_path) else 0,
+            size=server_size,
             role=role,
             created_at=now_utc(),
             expires_at=expires_at,
@@ -368,33 +510,22 @@ async def admin_home(request: Request):
     require_admin(request)
     q = request.query_params.get("q")
     settings_saved = request.query_params.get("settings_saved") == "1"
-    db = SessionLocal()
-    try:
-        guest_ttl_hours = get_guest_ttl_hours(db)
-        query = db.query(Upload).order_by(Upload.created_at.desc())
-        if q:
-            like = f"%{q}%"
-            query = query.filter(Upload.original_name.like(like))
-        items = query.limit(200).all()
-    finally:
-        db.close()
-    return templates.TemplateResponse("admin_dashboard.html", {
-        "request": request,
-        "items": items,
-        "q": q or "",
-        "max_mb": MAX_UPLOAD_MB,
-        "guest_ttl_hours": guest_ttl_hours,
-        "guest_ttl_label": guest_ttl_label(guest_ttl_hours),
-        "settings_saved": settings_saved,
-    })
+    return templates.TemplateResponse("admin_dashboard.html", admin_context(request, q=q, settings_saved=settings_saved))
 
 
 @app.post("/admin/settings/guest-ttl")
-async def admin_set_guest_ttl(request: Request, guest_ttl_hours: int = Form(...)):
+async def admin_set_guest_ttl(
+    request: Request,
+    guest_ttl_hours: int = Form(...),
+    total_upload_limit_mb: int = Form(...),
+):
     require_admin(request)
     if guest_ttl_hours < 0:
         raise HTTPException(status_code=400, detail="普通用户保存时间不能小于 0 小时")
+    if total_upload_limit_mb < 0:
+        raise HTTPException(status_code=400, detail="上传总容量限制不能小于 0 MB")
     set_guest_ttl_hours(guest_ttl_hours)
+    set_total_upload_limit_mb(total_upload_limit_mb)
     return RedirectResponse(url="/admin?settings_saved=1", status_code=302)
 
 
@@ -455,6 +586,39 @@ async def detail(request: Request, item_id: int):
         "item": item,
         "report": report
     })
+
+
+@app.get("/api/uploads/{item_id}/files")
+async def upload_files(item_id: int):
+    db = SessionLocal()
+    try:
+        item = db.get(Upload, item_id)
+        if not item or item.status != "active":
+            raise HTTPException(status_code=404)
+
+        exp = _as_aware_utc(item.expires_at)
+        if exp and exp < now_utc():
+            raise HTTPException(status_code=410, detail="文件已过期")
+
+        path = os.path.join(UPLOAD_DIR, item.stored_name)
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404)
+    finally:
+        db.close()
+
+    try:
+        with VPK(path) as arch:
+            files = sorted(str(rel).replace("\\", "/").lstrip("./") for rel in arch)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"读取 VPK 文件列表失败：{exc}")
+
+    return {
+        "id": item_id,
+        "original_name": item.original_name,
+        "stored_name": item.stored_name,
+        "file_count": len(files),
+        "files": files,
+    }
 
 
 # 下载：仅用 id，响应头用 RFC 5987 兼容中文和空格

@@ -19,5 +19,13 @@
     <pre>{{ report.server_build | tojson }}</pre>
   </details>
   {% endif %}
+  <details open class="vpk-files" data-files-url="/api/uploads/{{ item.id }}/files">
+    <summary>VPK 文件列表</summary>
+    <div class="file-list-controls">
+      <input type="search" class="file-list-search" placeholder="搜索文件路径">
+      <span class="muted file-list-status">正在加载...</span>
+    </div>
+    <ul class="file-list"></ul>
+  </details>
 </section>
 {% endblock %}
