@@ -32,10 +32,6 @@ pre { white-space: pre-wrap; word-break: break-word; background:#0b1220; padding
 .upload-progress__bar { width:0; height:100%; background:#22c55e; transition:width .2s ease; }
 .upload-progress.is-processing .upload-progress__bar { background:#38bdf8; }
 .upload-progress.is-error .upload-progress__bar { background:#ef4444; }
-.server-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:12px; }
-.server-tile { display:grid; gap:4px; padding:12px; border:1px solid #273449; border-radius:8px; color:#e6edf3; text-decoration:none; background:#0b1220; }
-.server-tile:hover, .server-tile.is-active { border-color:#1f6feb; background:#101a2c; }
-.server-tile span, .server-tile em { color:#9ca3af; font-size:13px; font-style:normal; }
 @media (max-width: 720px) {
   .upload-form.row { align-items:stretch; flex-direction:column; }
   .upload-form.row .upload-progress { flex:auto; margin-top:4px; }

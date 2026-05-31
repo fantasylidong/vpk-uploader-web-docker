@@ -4,7 +4,7 @@ import shutil
 import secrets
 import json
 import time
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -38,14 +38,6 @@ BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(os.path.dirname(BASE_DIR), "data")
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-THIRDPARTY_MAP_SERVERS_JSON = os.getenv(
-    "THIRDPARTY_MAP_SERVERS_JSON",
-    os.getenv("SERVER_MAPS_JSON", ""),
-)
-THIRDPARTY_MAP_SERVERS_FILE = os.getenv(
-    "THIRDPARTY_MAP_SERVERS_FILE",
-    os.getenv("SERVER_MAPS_FILE", os.path.join(DATA_DIR, "server_maps.json")),
-)
 
 # 重要：上传文件与工作目录在系统 /tmp
 TMP_DIR = os.getenv("TMP_DIR", "/tmp")
@@ -201,125 +193,7 @@ def _public_url(path: str) -> str:
     return f"{PUBLIC_BASE_URL}{path}"
 
 
-def _load_thirdparty_server_config() -> dict:
-    raw = THIRDPARTY_MAP_SERVERS_JSON.strip()
-    if not raw and THIRDPARTY_MAP_SERVERS_FILE:
-        try:
-            if os.path.exists(THIRDPARTY_MAP_SERVERS_FILE):
-                with open(THIRDPARTY_MAP_SERVERS_FILE, "r", encoding="utf-8") as fh:
-                    raw = fh.read().strip()
-        except Exception:
-            raw = ""
-
-    if not raw:
-        return {"servers": []}
-
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return {"servers": []}
-
-    if isinstance(parsed, list):
-        return {"servers": parsed}
-    if isinstance(parsed, dict):
-        return parsed
-    return {"servers": []}
-
-
-def _normalize_map_entry(raw, index: int) -> dict:
-    if isinstance(raw, str):
-        return {"id": raw, "name": raw}
-    if not isinstance(raw, dict):
-        return {"id": f"map-{index + 1}", "name": str(raw)}
-
-    name = (
-        raw.get("name")
-        or raw.get("title")
-        or raw.get("map")
-        or raw.get("file")
-        or raw.get("filename")
-        or raw.get("original_name")
-        or raw.get("stored_name")
-        or f"map-{index + 1}"
-    )
-    item = {
-        "id": str(raw.get("id") or raw.get("key") or name),
-        "name": str(name),
-    }
-    for key in ("version", "size", "size_label", "updated_at", "workshop_id"):
-        if raw.get(key) is not None:
-            item[key] = raw.get(key)
-    for key in ("download_url", "detail_url", "workshop_url"):
-        if raw.get(key):
-            item[key] = _public_url(str(raw.get(key)))
-    return item
-
-
-def _normalize_server_entry(raw, index: int) -> dict:
-    if isinstance(raw, str):
-        raw = {"address": raw, "name": raw}
-    if not isinstance(raw, dict):
-        raw = {"name": str(raw)}
-
-    address = str(raw.get("address") or raw.get("addr") or raw.get("host_port") or "")
-    if not address and raw.get("host") and raw.get("port"):
-        address = f"{raw.get('host')}:{raw.get('port')}"
-
-    name = str(raw.get("name") or raw.get("title") or raw.get("hostname") or address or f"服务器 {index + 1}")
-    server_id = str(raw.get("id") or raw.get("key") or raw.get("server") or address or name or f"server-{index + 1}")
-    maps_raw = raw.get("maps") or raw.get("thirdparty_maps") or raw.get("vpk_maps") or raw.get("uploads") or []
-    if isinstance(maps_raw, dict):
-        maps_raw = list(maps_raw.values())
-    if not isinstance(maps_raw, list):
-        maps_raw = [maps_raw]
-
-    upload_url = str(raw.get("upload_url") or raw.get("upload") or "")
-    if upload_url:
-        upload_url = _public_url(upload_url)
-    else:
-        query = {"server": server_id}
-        if address:
-            query["address"] = address
-        if name:
-            query["name"] = name
-        upload_url = _public_url("/?" + urlencode(query))
-
-    item = {
-        "id": server_id,
-        "name": name,
-        "address": address,
-        "status": str(raw.get("status") or ""),
-        "upload_url": upload_url,
-        "maps": [_normalize_map_entry(map_raw, map_index) for map_index, map_raw in enumerate(maps_raw)],
-    }
-    if raw.get("detail_url"):
-        item["detail_url"] = _public_url(str(raw.get("detail_url")))
-    return item
-
-
-def thirdparty_server_catalog() -> dict:
-    config = _load_thirdparty_server_config()
-    servers_raw = config.get("servers") if isinstance(config, dict) else []
-    if isinstance(servers_raw, dict):
-        servers_raw = [
-            {"id": key, **(value if isinstance(value, dict) else {"maps": value})}
-            for key, value in servers_raw.items()
-        ]
-    if not isinstance(servers_raw, list):
-        servers_raw = []
-
-    return {
-        "generated_at": now_utc().isoformat(),
-        "public_base_url": PUBLIC_BASE_URL,
-        "upload_url": _public_url("/"),
-        "admin_url": _public_url("/admin"),
-        "servers": [_normalize_server_entry(raw, index) for index, raw in enumerate(servers_raw)],
-    }
-
-
 def thirdparty_map_api_payload() -> dict:
-    payload = thirdparty_server_catalog()
-    uploads_by_server = {}
     db = SessionLocal()
     try:
         rows = (
@@ -329,62 +203,39 @@ def thirdparty_map_api_payload() -> dict:
             .limit(200)
             .all()
         )
-        uploads = []
+        maps = []
         for item in rows:
-            report = {}
-            try:
-                report = json.loads(item.vpk_report or "{}")
-            except json.JSONDecodeError:
-                report = {}
-            server_id = str(report.get("server") or "")
-            upload_item = {
+            maps.append({
                 "id": item.id,
+                "name": item.original_name,
                 "original_name": item.original_name,
                 "stored_name": item.stored_name,
                 "size": item.size,
+                "size_label": _format_mb(item.size or 0),
                 "role": item.role,
                 "created_at": item.created_at.isoformat() if item.created_at else None,
                 "expires_at": item.expires_at.isoformat() if item.expires_at else None,
-                "server": server_id,
                 "detail_url": _public_url(f"/detail/{item.id}"),
                 "download_url": _public_url(f"/d/{item.id}"),
-            }
-            uploads.append(upload_item)
-            if server_id:
-                uploads_by_server.setdefault(server_id, []).append(upload_item)
+                "files_url": _public_url(f"/api/uploads/{item.id}/files"),
+            })
     finally:
         db.close()
 
-    for server in payload["servers"]:
-        server_uploads = uploads_by_server.get(server["id"], [])
-        if not server_uploads:
-            continue
-        server["maps"].extend([
-            {
-                "id": f"upload-{upload['id']}",
-                "name": upload["original_name"],
-                "size": upload["size"],
-                "updated_at": upload["created_at"],
-                "detail_url": upload["detail_url"],
-                "download_url": upload["download_url"],
-            }
-            for upload in server_uploads
-        ])
-
-    payload["active_uploads"] = uploads
-    return payload
+    return {
+        "generated_at": now_utc().isoformat(),
+        "public_base_url": PUBLIC_BASE_URL,
+        "upload_url": _public_url("/"),
+        "admin_url": _public_url("/admin"),
+        "map_count": len(maps),
+        "maps": maps,
+    }
 
 
 def index_context(request: Request, error: Optional[str] = None, report=None) -> dict:
     db = SessionLocal()
     try:
         guest_ttl_hours = get_guest_ttl_hours(db)
-        server_catalog = thirdparty_server_catalog()
-        selected_server = request.query_params.get("server") or ""
-        selected_server_info = next(
-            (server for server in server_catalog["servers"] if server["id"] == selected_server),
-            None,
-        )
         context = {
             "request": request,
             "max_mb": MAX_UPLOAD_MB,
@@ -392,9 +243,6 @@ def index_context(request: Request, error: Optional[str] = None, report=None) ->
             "guest_ttl_label": guest_ttl_label(guest_ttl_hours),
             "error": error,
             "report": report,
-            "thirdparty_servers": server_catalog["servers"],
-            "selected_server": selected_server,
-            "selected_server_info": selected_server_info,
         }
         context.update(storage_context(db))
         return context
@@ -738,10 +586,7 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
                 pass
             return None, upload_error_response(request, role, capacity_error)
 
-        selected_server = str(request.query_params.get("server") or "")
         report = {"validation": vr.to_dict(), "server_build": build_report}
-        if selected_server:
-            report["server"] = selected_server
 
         up = Upload(
             original_name=original_name,

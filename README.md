@@ -6,7 +6,7 @@
 - 下载端点使用 **RFC5987**（`filename*=`）修复**中文文件名 500**。
 - 自带兜底清理：临时区 `data/tmp/`、构建残留 `_work_*`。
 - SFTP 直接放进 `/app/data/uploads` 的 `.vpk` 会自动登记为管理员上传，永久保存。
-- 提供 `/api/thirdparty-maps`，给 AnneWeb 后台查询“服务器 → 三方图 → 上传入口”。
+- 提供 `/api/thirdparty-maps`，给 NewAnneWeb 查询当前可用图包清单。
 
 ## 本地构建
 ```bash
@@ -26,20 +26,35 @@ docker run -d --name vpk-uploader -p 8080:8080   -e APP_SECRET="change-me" -e AD
 - `/app/data/uploads`：最终服务器版 VPK；也可通过 SFTP 直接放入 `.vpk`，系统会按管理员上传自动登记
 - `/app/data/tmp`：上传临时文件（流程结束即删，附兜底清理）
 
-## 三方图服务器配置
-可以用环境变量 `THIRDPARTY_MAP_SERVERS_JSON`，或默认文件 `/app/data/server_maps.json` 配置服务器和已有三方图：
+## NewAnneWeb 对接接口
+上传服务只负责告诉 NewAnneWeb 当前有哪些可用图包，不维护“哪些服务器安装了哪些图”。服务器维度由 NewAnneWeb 自己处理。
+
+接口地址：`/api/thirdparty-maps`。如果 NewAnneWeb 需要拿到完整外网链接，设置 `PUBLIC_BASE_URL=https://your-uploader.example.com`。
+
+返回示例：
 
 ```json
 {
-  "servers": [
+  "generated_at": "2026-05-31T12:00:00+00:00",
+  "public_base_url": "https://your-uploader.example.com",
+  "upload_url": "https://your-uploader.example.com/",
+  "admin_url": "https://your-uploader.example.com/admin",
+  "map_count": 1,
+  "maps": [
     {
-      "id": "anne-2330",
-      "name": "Anne 1 服",
-      "address": "home.trygek.com:2330",
-      "maps": ["死亡中心改版", "坠机险途扩展"]
+      "id": 1,
+      "name": "死亡中心改版.vpk",
+      "original_name": "死亡中心改版.vpk",
+      "stored_name": "死亡中心改版_server.vpk",
+      "size": 1048576,
+      "size_label": "1.00 MB",
+      "role": "guest",
+      "created_at": "2026-05-31T12:00:00+00:00",
+      "expires_at": "2026-06-01T12:00:00+00:00",
+      "detail_url": "https://your-uploader.example.com/detail/1",
+      "download_url": "https://your-uploader.example.com/d/1",
+      "files_url": "https://your-uploader.example.com/api/uploads/1/files"
     }
   ]
 }
 ```
-
-接口地址：`/api/thirdparty-maps`。如需 AnneWeb 后台跳转到外网地址，设置 `PUBLIC_BASE_URL=https://your-uploader.example.com`。
