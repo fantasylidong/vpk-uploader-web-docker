@@ -10,6 +10,9 @@ services:
       - ADMIN_PASS=${ADMIN_PASS:-admin123}
       - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-1024}
       - DEFAULT_GUEST_TTL_HOURS=${DEFAULT_GUEST_TTL_HOURS:-24}
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - THIRDPARTY_MAP_SERVERS_JSON=${THIRDPARTY_MAP_SERVERS_JSON:-}
+      - THIRDPARTY_MAP_SERVERS_FILE=${THIRDPARTY_MAP_SERVERS_FILE:-/app/data/server_maps.json}
       - TZ=${TZ:-Asia/Shanghai}
     volumes:
       - ./data:/app/data

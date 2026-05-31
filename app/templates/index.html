@@ -1,8 +1,20 @@
 {% extends "base.html" %}
 {% block content %}
 <section class="card">
-  <h2>公共上传（{{ guest_ttl_label }}）</h2>
-  <form action="/upload" method="post" enctype="multipart/form-data" class="upload-form">
+  <h2>
+    {% if selected_server_info %}
+      {{ selected_server_info.name }} · 三方图上传
+    {% else %}
+      公共上传（{{ guest_ttl_label }}）
+    {% endif %}
+  </h2>
+  {% if selected_server_info %}
+    <p class="muted">
+      目标服务器：{{ selected_server_info.name }}
+      {% if selected_server_info.address %}（{{ selected_server_info.address }}）{% endif %}
+    </p>
+  {% endif %}
+  <form action="/upload{% if selected_server %}?server={{ selected_server | urlencode }}{% endif %}" method="post" enctype="multipart/form-data" class="upload-form">
     <input type="file" name="file" accept=".vpk" required>
     <button type="submit">上传 .vpk</button>
     <p class="muted">单文件上限：{{ max_mb }} MB，仅允许 .vpk；普通用户文件{{ guest_ttl_label }}；上传总容量：{{ total_upload_usage_label }}；上传完成后仅保留“服务器版”</p>
@@ -26,4 +38,18 @@
     </details>
   {% endif %}
 </section>
+{% if thirdparty_servers %}
+<section class="card server-card">
+  <h2>服务器入口</h2>
+  <div class="server-grid">
+    {% for server in thirdparty_servers %}
+      <a class="server-tile{% if selected_server == server.id %} is-active{% endif %}" href="{{ server.upload_url }}">
+        <strong>{{ server.name }}</strong>
+        {% if server.address %}<span>{{ server.address }}</span>{% endif %}
+        <em>{{ server.maps | length }} 个三方图</em>
+      </a>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
 {% endblock %}
