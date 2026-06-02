@@ -24,6 +24,10 @@ pre { white-space: pre-wrap; word-break: break-word; background:#0b1220; padding
 .file-list-search { min-width:240px; }
 .file-list { max-height:360px; overflow:auto; margin:0; padding:8px 8px 8px 28px; background:#0b1220; border:1px solid #1f2937; border-radius:8px; }
 .file-list li { padding:3px 0; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:13px; word-break:break-all; }
+.batch-results { margin-top:16px; }
+.batch-results h3 { margin:0 0 8px; font-size:16px; }
+.batch-failures { margin:8px 0 0; padding-left:22px; }
+.batch-failures li { margin:6px 0; word-break:break-word; }
 .upload-progress { width:100%; min-width:220px; margin-top:12px; }
 .row .upload-progress { flex:1 1 260px; margin-top:0; }
 .upload-progress__meta { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:6px; color:#cbd5e1; font-size:14px; }

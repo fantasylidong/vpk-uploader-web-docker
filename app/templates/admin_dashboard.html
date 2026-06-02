@@ -15,13 +15,16 @@
   {% if settings_saved %}
     <div class="success">设置已更新</div>
   {% endif %}
+  {% if upload_message %}
+    <div class="success">{{ upload_message }}</div>
+  {% endif %}
   {% if upload_error %}
     <div class="error">{{ upload_error }}</div>
   {% endif %}
 
   <form action="/admin/upload" method="post" enctype="multipart/form-data" class="row upload-form">
     <div>
-      <input type="file" name="file" accept=".vpk" required>
+      <input type="file" name="file" accept="{{ upload_accept }}" required>
     </div>
     <div>
       <label>有效期（小时，0=永久） <input type="number" min="0" name="ttl_hours" value="0"></label>

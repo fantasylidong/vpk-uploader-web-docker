@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TZ=Etc/UTC
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tzdata \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata libarchive-tools \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

@@ -4,6 +4,8 @@ import shutil
 import secrets
 import json
 import time
+import select
+import subprocess
 from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -28,6 +30,13 @@ DEFAULT_GUEST_TTL_HOURS = int(os.getenv("DEFAULT_GUEST_TTL_HOURS", "24"))
 TOTAL_UPLOAD_LIMIT_SETTING_KEY = "total_upload_limit_mb"
 GUEST_TTL_SETTING_KEY = "guest_ttl_hours"
 RULES_FILE = os.getenv("RULES_FILE", "rules.yml")
+UPLOAD_EXTENSIONS = (".vpk", ".zip", ".rar", ".7z")
+ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z"}
+UPLOAD_ACCEPT = ",".join(UPLOAD_EXTENSIONS)
+UPLOAD_TYPE_LABEL = ".vpk / .zip / .rar / .7z"
+MAX_ARCHIVE_VPK_COUNT = int(os.getenv("MAX_ARCHIVE_VPK_COUNT", "50"))
+ARCHIVE_LIST_TIMEOUT_SECONDS = int(os.getenv("ARCHIVE_LIST_TIMEOUT_SECONDS", "120"))
+ARCHIVE_EXTRACT_TIMEOUT_SECONDS = int(os.getenv("ARCHIVE_EXTRACT_TIMEOUT_SECONDS", "600"))
 
 # 清理策略（分钟/小时）
 TMP_MAX_AGE_MIN = int(os.getenv("TMP_MAX_AGE_MIN", "30"))
@@ -232,17 +241,25 @@ def thirdparty_map_api_payload() -> dict:
     }
 
 
-def index_context(request: Request, error: Optional[str] = None, report=None) -> dict:
+def index_context(
+    request: Request,
+    error: Optional[str] = None,
+    report=None,
+    batch_results: Optional[dict] = None,
+) -> dict:
     db = SessionLocal()
     try:
         guest_ttl_hours = get_guest_ttl_hours(db)
         context = {
             "request": request,
             "max_mb": MAX_UPLOAD_MB,
+            "upload_accept": UPLOAD_ACCEPT,
+            "upload_type_label": UPLOAD_TYPE_LABEL,
             "guest_ttl_hours": guest_ttl_hours,
             "guest_ttl_label": guest_ttl_label(guest_ttl_hours),
             "error": error,
             "report": report,
+            "batch_results": batch_results,
         }
         context.update(storage_context(db))
         return context
@@ -255,6 +272,7 @@ def admin_context(
     q: Optional[str] = None,
     settings_saved: bool = False,
     upload_error: Optional[str] = None,
+    upload_message: Optional[str] = None,
 ) -> dict:
     db = SessionLocal()
     try:
@@ -269,10 +287,13 @@ def admin_context(
             "items": items,
             "q": q or "",
             "max_mb": MAX_UPLOAD_MB,
+            "upload_accept": UPLOAD_ACCEPT,
+            "upload_type_label": UPLOAD_TYPE_LABEL,
             "guest_ttl_hours": guest_ttl_hours,
             "guest_ttl_label": guest_ttl_label(guest_ttl_hours),
             "settings_saved": settings_saved,
             "upload_error": upload_error,
+            "upload_message": upload_message,
         }
         context.update(storage_context(db))
         return context
@@ -284,6 +305,18 @@ def upload_error_response(request: Request, role: str, message: str, report=None
     if role == "admin":
         return templates.TemplateResponse("admin_dashboard.html", admin_context(request, upload_error=message))
     return templates.TemplateResponse("index.html", index_context(request, error=message, report=report))
+
+
+def upload_batch_response(request: Request, role: str, results: dict):
+    if role == "admin":
+        ok_count = len(results.get("uploaded", []))
+        failed_count = len(results.get("failed", []))
+        message = f"批量上传完成：成功 {ok_count} 个"
+        if failed_count:
+            message = f"{message}，失败 {failed_count} 个"
+        return templates.TemplateResponse("admin_dashboard.html", admin_context(request, upload_message=message))
+
+    return templates.TemplateResponse("index.html", index_context(request, batch_results=results))
 
 
 def total_capacity_error(db, new_file_size: int) -> Optional[str]:
@@ -308,24 +341,170 @@ def total_capacity_error(db, new_file_size: int) -> Optional[str]:
 
 def _basename_only(filename: str) -> str:
     """取纯文件名（去路径），并禁止目录穿越。"""
-    base = os.path.basename(filename)
-    return base.replace("/", "").replace("\\", "")
+    base = os.path.basename((filename or "").replace("\\", "/"))
+    return base.replace("/", "").replace("\\", "").replace("\x00", "").strip()
 
 
-def _ensure_single_dot_vpk(filename: str):
-    """上传名只能有一个点，且扩展名必须是 .vpk"""
+def _split_supported_upload(filename: str):
+    """上传文件必须是 VPK 或受支持的压缩包。"""
     base = _basename_only(filename)
-    if base.count(".") != 1 or not base.lower().endswith(".vpk"):
-        raise HTTPException(status_code=400, detail="文件名非法：只能包含一个点且必须以 .vpk 结尾")
+    lower = base.lower()
+    for ext in UPLOAD_EXTENSIONS:
+        if lower.endswith(ext) and base[:-len(ext)].strip():
+            return base, ext
+    raise HTTPException(status_code=400, detail=f"文件名非法：仅支持 {UPLOAD_TYPE_LABEL}")
+
+
+def _ensure_vpk_filename(filename: str) -> str:
+    """返回安全的 VPK 文件名。"""
+    base = _basename_only(filename)
+    if not base.lower().endswith(".vpk") or not base[:-4].strip():
+        raise HTTPException(status_code=400, detail="VPK 文件名非法：必须以 .vpk 结尾")
     return base
 
 
 def _safe_base_no_ext(filename: str) -> str:
     """基于原始上传名生成工作目录名（不含扩展名），保留中文与空格，移除斜杠。"""
-    base = _ensure_single_dot_vpk(filename)
+    base = _ensure_vpk_filename(filename)
     name_no_ext = os.path.splitext(base)[0]
     name_no_ext = name_no_ext.strip().replace("/", "").replace("\\", "")
     return name_no_ext or "upload"
+
+
+def _remove_file_quietly(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def _bsdtar_path() -> str:
+    path = shutil.which("bsdtar")
+    if not path:
+        raise HTTPException(status_code=500, detail="服务器未安装压缩包解包工具 bsdtar")
+    return path
+
+
+def _archive_error(stderr: str) -> str:
+    stderr = (stderr or "").strip()
+    if not stderr:
+        return "压缩包读取失败"
+    return f"压缩包读取失败：{stderr[:300]}"
+
+
+def _list_archive_members(archive_path: str) -> list[str]:
+    try:
+        proc = subprocess.run(
+            [_bsdtar_path(), "-tf", archive_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=ARCHIVE_LIST_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=400, detail="压缩包读取超时")
+
+    if proc.returncode != 0:
+        raise HTTPException(status_code=400, detail=_archive_error(proc.stderr))
+
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _extract_archive_member_to_file(archive_path: str, member: str, dest_path: str, max_bytes: int) -> int:
+    cmd = [_bsdtar_path(), "-x", "-O", "-f", archive_path, "--", member]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout_fd = proc.stdout.fileno()
+    stderr_fd = proc.stderr.fileno()
+    open_fds = {stdout_fd, stderr_fd}
+    stderr_chunks: list[bytes] = []
+    stderr_size = 0
+    extracted_bytes = 0
+    started_at = time.monotonic()
+
+    try:
+        with open(dest_path, "wb") as out:
+            while open_fds:
+                if time.monotonic() - started_at > ARCHIVE_EXTRACT_TIMEOUT_SECONDS:
+                    proc.kill()
+                    raise HTTPException(status_code=400, detail="压缩包解压超时")
+
+                ready, _, _ = select.select(list(open_fds), [], [], 1)
+                if not ready:
+                    continue
+
+                for fd in ready:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk:
+                        open_fds.discard(fd)
+                        continue
+
+                    if fd == stdout_fd:
+                        extracted_bytes += len(chunk)
+                        if extracted_bytes > max_bytes:
+                            proc.kill()
+                            raise HTTPException(status_code=400, detail=f"压缩包内的 VPK 解压后超过 {MAX_UPLOAD_MB} MB 限制")
+                        out.write(chunk)
+                    elif stderr_size < 8192:
+                        stderr_chunks.append(chunk)
+                        stderr_size += len(chunk)
+
+        return_code = proc.wait(timeout=5)
+    except HTTPException:
+        proc.kill()
+        proc.wait(timeout=5)
+        _remove_file_quietly(dest_path)
+        raise
+    except Exception:
+        proc.kill()
+        proc.wait(timeout=5)
+        _remove_file_quietly(dest_path)
+        raise
+
+    stderr = b"".join(stderr_chunks).decode("utf-8", "replace")
+    if return_code != 0:
+        _remove_file_quietly(dest_path)
+        raise HTTPException(status_code=400, detail=_archive_error(stderr))
+    if extracted_bytes <= 0:
+        _remove_file_quietly(dest_path)
+        raise HTTPException(status_code=400, detail="压缩包内的 VPK 为空")
+
+    return extracted_bytes
+
+
+def _archive_vpk_members(archive_path: str) -> list[str]:
+    members = _list_archive_members(archive_path)
+    vpk_members = [member for member in members if _basename_only(member).lower().endswith(".vpk")]
+
+    if not vpk_members:
+        raise HTTPException(status_code=400, detail="压缩包中没有找到 .vpk 文件")
+    if len(vpk_members) > MAX_ARCHIVE_VPK_COUNT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"压缩包中包含 {len(vpk_members)} 个 .vpk，超过单次最多 {MAX_ARCHIVE_VPK_COUNT} 个限制",
+        )
+
+    return vpk_members
+
+
+def _extract_archive_vpk_member(archive_path: str, archive_name: str, member: str, max_bytes: int):
+    vpk_name = _ensure_vpk_filename(member)
+    tmp_vpk_path = os.path.join(TMP_DIR, f"{secrets.token_hex(6)}.vpk")
+    extracted_bytes = _extract_archive_member_to_file(archive_path, member, tmp_vpk_path, max_bytes)
+
+    return tmp_vpk_path, vpk_name, {
+        "source": "archive",
+        "uploaded_name": archive_name,
+        "archive_member": member,
+        "source_vpk_name": vpk_name,
+        "extracted_size": extracted_bytes,
+    }
 
 
 def _sha256_file(path: str) -> str:
@@ -337,6 +516,120 @@ def _sha256_file(path: str) -> str:
                 break
             sha256.update(chunk)
     return sha256.hexdigest()
+
+
+def _unique_server_filename(db, work_base: str) -> str:
+    base = work_base or "upload"
+    candidate = f"{base}_server.vpk"
+    index = 2
+
+    while True:
+        path = os.path.join(UPLOAD_DIR, candidate)
+        exists_in_db = db.query(Upload.id).filter(Upload.stored_name == candidate).first() is not None
+        if not exists_in_db and not os.path.exists(path):
+            return candidate
+        candidate = f"{base}_{index}_server.vpk"
+        index += 1
+
+
+def _upload_item_result(up: Upload) -> dict:
+    return {
+        "id": up.id,
+        "original_name": up.original_name,
+        "stored_name": up.stored_name,
+        "size": up.size,
+        "size_label": _format_mb(up.size or 0),
+        "detail_url": f"/detail/{up.id}",
+        "download_url": f"/d/{up.id}",
+    }
+
+
+def _expiry_for_upload(db, role: str, ttl_hours: Optional[int]) -> Optional[datetime]:
+    if role == "guest":
+        guest_ttl_hours = get_guest_ttl_hours(db)
+        if guest_ttl_hours > 0:
+            return now_utc() + timedelta(hours=guest_ttl_hours)
+        return None
+
+    if ttl_hours is not None and ttl_hours > 0:
+        return now_utc() + timedelta(hours=ttl_hours)
+    return None
+
+
+def _process_vpk_upload(
+    request: Request,
+    role: str,
+    ttl_hours: Optional[int],
+    tmp_vpk_path: str,
+    source_vpk_name: str,
+    upload_sha256: str,
+    upload_source: dict,
+):
+    display_name = _ensure_vpk_filename(source_vpk_name)
+    work_base = _safe_base_no_ext(display_name)
+
+    try:
+        vr: ValidationResult = validate_vpk(tmp_vpk_path, RULES_FILE)
+    except Exception as exc:
+        _remove_file_quietly(tmp_vpk_path)
+        raise HTTPException(status_code=400, detail=f"VPK 读取失败：{exc}")
+
+    if not vr.ok:
+        _remove_file_quietly(tmp_vpk_path)
+        return None, {
+            "name": display_name,
+            "error": "VPK 不符合要求",
+            "report": vr.to_dict(),
+        }
+
+    db = SessionLocal()
+    final_name = None
+    try:
+        expires_at = _expiry_for_upload(db, role, ttl_hours)
+        final_name = _unique_server_filename(db, work_base)
+
+        build_report = process_server_vpk(
+            src_vpk_path=tmp_vpk_path,
+            work_dir_root=TMP_DIR,
+            work_base_name=f"{work_base}_{secrets.token_hex(4)}",
+            output_dir=UPLOAD_DIR,
+            output_filename=final_name,
+        )
+
+        server_path = os.path.join(UPLOAD_DIR, final_name)
+        server_size = os.path.getsize(server_path) if os.path.exists(server_path) else 0
+        capacity_error = total_capacity_error(db, server_size)
+        if capacity_error:
+            _remove_file_quietly(server_path)
+            return None, {"name": display_name, "error": capacity_error}
+
+        report = {"upload_source": upload_source, "validation": vr.to_dict(), "server_build": build_report}
+
+        up = Upload(
+            original_name=display_name,
+            stored_name=final_name,
+            sha256=upload_sha256,
+            size=server_size,
+            role=role,
+            created_at=now_utc(),
+            expires_at=expires_at,
+            vpk_valid=True,
+            vpk_report=json.dumps(report, ensure_ascii=False),
+            status="active",
+            uploader_ip=request.client.host if request.client else None,
+        )
+        db.add(up)
+        db.commit()
+        db.refresh(up)
+        result = _upload_item_result(up)
+        return up, result
+    except Exception:
+        if final_name:
+            _remove_file_quietly(os.path.join(UPLOAD_DIR, final_name))
+        _remove_file_quietly(tmp_vpk_path)
+        raise
+    finally:
+        db.close()
 
 
 def _file_newer_than_upload_record(stat: os.stat_result, upload: Upload) -> bool:
@@ -521,19 +814,17 @@ async def index(request: Request):
 
 
 async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hours: Optional[int]):
-    # 1) 文件名校验（只允许一个点且扩展名 .vpk）
-    original_name = _ensure_single_dot_vpk(file.filename)
-    work_base = _safe_base_no_ext(original_name)  # 工作目录名 = 原名去扩展名
-    final_name = f"{work_base}_server.vpk"        # 生成到 uploads 的最终文件名
+    # 1) 文件名校验：允许直接上传 VPK，或上传包含多个 VPK 的压缩包。
+    original_name, upload_ext = _split_supported_upload(file.filename)
 
     # 2) 上传流写入系统 /tmp
     max_bytes = MAX_UPLOAD_MB * 1024 * 1024
-    tmp_vpk_path = os.path.join(TMP_DIR, f"{secrets.token_hex(6)}.vpk")
+    tmp_upload_path = os.path.join(TMP_DIR, f"{secrets.token_hex(6)}{upload_ext}")
 
     read_bytes = 0
     sha256 = hashlib.sha256()
 
-    with open(tmp_vpk_path, "wb") as out:
+    with open(tmp_upload_path, "wb") as out:
         while True:
             chunk = await file.read(1024 * 1024)
             if not chunk:
@@ -541,81 +832,97 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
             read_bytes += len(chunk)
             if read_bytes > max_bytes:
                 out.close()
-                os.remove(tmp_vpk_path)
+                _remove_file_quietly(tmp_upload_path)
                 raise HTTPException(status_code=400, detail=f"文件过大，超过 {MAX_UPLOAD_MB} MB 限制")
             sha256.update(chunk)
             out.write(chunk)
 
-    # 3) 合规校验
-    vr: ValidationResult = validate_vpk(tmp_vpk_path, RULES_FILE)
-    if not vr.ok:
-        try:
-            os.remove(tmp_vpk_path)
-        except Exception:
-            pass
-        return None, upload_error_response(request, role, "VPK 不符合要求", report=vr.to_dict())
+    upload_sha256 = sha256.hexdigest()
+    uploaded = []
+    failed = []
+    uploads = []
 
-    # 4) 仅服务器版：在 /tmp 下以“原名”做工作目录，解包后立刻删除原始 .vpk，再重打包到 uploads
-    build_report = process_server_vpk(
-        src_vpk_path=tmp_vpk_path,
-        work_dir_root=TMP_DIR,
-        work_base_name=work_base,
-        output_dir=UPLOAD_DIR,
-        output_filename=final_name,
-    )
-
-    # 5) 入库
-    db = SessionLocal()
     try:
-        expires_at = None
-        if role == "guest":
-            guest_ttl_hours = get_guest_ttl_hours(db)
-            if guest_ttl_hours > 0:
-                expires_at = now_utc() + timedelta(hours=guest_ttl_hours)
+        if upload_ext in ARCHIVE_EXTENSIONS:
+            archive_members = _archive_vpk_members(tmp_upload_path)
+            for index, member in enumerate(archive_members, start=1):
+                tmp_vpk_path = None
+                try:
+                    tmp_vpk_path, source_vpk_name, upload_source = _extract_archive_vpk_member(
+                        tmp_upload_path,
+                        original_name,
+                        member,
+                        max_bytes,
+                    )
+                    upload_source.update({
+                        "uploaded_size": read_bytes,
+                        "archive_vpk_index": index,
+                        "archive_vpk_count": len(archive_members),
+                    })
+                    up, result = _process_vpk_upload(
+                        request=request,
+                        role=role,
+                        ttl_hours=ttl_hours,
+                        tmp_vpk_path=tmp_vpk_path,
+                        source_vpk_name=source_vpk_name,
+                        upload_sha256=upload_sha256,
+                        upload_source=upload_source,
+                    )
+                    tmp_vpk_path = None
+                    if up is not None:
+                        uploads.append(up)
+                        uploaded.append(result)
+                    else:
+                        failed.append(result)
+                except HTTPException as exc:
+                    _remove_file_quietly(tmp_vpk_path)
+                    failed.append({"name": _basename_only(member) or member, "error": str(exc.detail)})
+                except Exception as exc:
+                    _remove_file_quietly(tmp_vpk_path)
+                    failed.append({"name": _basename_only(member) or member, "error": f"处理失败：{exc}"})
         else:
-            if ttl_hours is not None and ttl_hours > 0:
-                expires_at = now_utc() + timedelta(hours=ttl_hours)
-
-        server_path = os.path.join(UPLOAD_DIR, final_name)
-        server_size = os.path.getsize(server_path) if os.path.exists(server_path) else 0
-        capacity_error = total_capacity_error(db, server_size)
-        if capacity_error:
-            try:
-                os.remove(server_path)
-            except Exception:
-                pass
-            return None, upload_error_response(request, role, capacity_error)
-
-        report = {"validation": vr.to_dict(), "server_build": build_report}
-
-        up = Upload(
-            original_name=original_name,
-            stored_name=final_name,
-            sha256=sha256.hexdigest(),
-            size=server_size,
-            role=role,
-            created_at=now_utc(),
-            expires_at=expires_at,
-            vpk_valid=True,
-            vpk_report=json.dumps(report, ensure_ascii=False),
-            status="active",
-            uploader_ip=request.client.host if request.client else None,
-        )
-        db.add(up)
-        db.commit()
-        db.refresh(up)
+            upload_source = {
+                "source": "vpk",
+                "uploaded_name": original_name,
+                "source_vpk_name": original_name,
+                "uploaded_size": read_bytes,
+            }
+            up, result = _process_vpk_upload(
+                request=request,
+                role=role,
+                ttl_hours=ttl_hours,
+                tmp_vpk_path=tmp_upload_path,
+                source_vpk_name=original_name,
+                upload_sha256=upload_sha256,
+                upload_source=upload_source,
+            )
+            tmp_upload_path = None
+            if up is not None:
+                uploads.append(up)
+                uploaded.append(result)
+            else:
+                failed.append(result)
     finally:
-        db.close()
+        _remove_file_quietly(tmp_upload_path)
 
-    return up, None
+    results = {"uploaded": uploaded, "failed": failed}
+
+    if uploaded:
+        return uploads, results, None
+
+    first_failure = failed[0] if failed else {"error": "没有成功处理任何 VPK"}
+    report = first_failure.get("report")
+    return [], results, upload_error_response(request, role, first_failure["error"], report=report)
 
 
 @app.post("/upload")
 async def guest_upload(request: Request, file: UploadFile):
-    up, resp = await _handle_upload(request, file, role="guest", ttl_hours=None)
+    uploads, results, resp = await _handle_upload(request, file, role="guest", ttl_hours=None)
     if resp is not None:
         return resp
-    return RedirectResponse(url=f"/detail/{up.id}", status_code=302)
+    if len(uploads) == 1 and not results["failed"]:
+        return RedirectResponse(url=f"/detail/{uploads[0].id}", status_code=302)
+    return upload_batch_response(request, "guest", results)
 
 
 def require_admin(request: Request):
@@ -673,9 +980,11 @@ async def admin_set_guest_ttl(
 @app.post("/admin/upload")
 async def admin_upload(request: Request, file: UploadFile, ttl_hours: Optional[int] = Form(None)):
     require_admin(request)
-    up, resp = await _handle_upload(request, file, role="admin", ttl_hours=ttl_hours)
+    uploads, results, resp = await _handle_upload(request, file, role="admin", ttl_hours=ttl_hours)
     if resp is not None:
         return resp
+    if len(uploads) > 1 or results["failed"]:
+        return upload_batch_response(request, "admin", results)
     return RedirectResponse(url="/admin", status_code=302)
 
 

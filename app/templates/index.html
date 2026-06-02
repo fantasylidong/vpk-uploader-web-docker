@@ -3,9 +3,9 @@
 <section class="card">
   <h2>公共上传（{{ guest_ttl_label }}）</h2>
   <form action="/upload" method="post" enctype="multipart/form-data" class="upload-form">
-    <input type="file" name="file" accept=".vpk" required>
-    <button type="submit">上传 .vpk</button>
-    <p class="muted">单文件上限：{{ max_mb }} MB，仅允许 .vpk；普通用户文件{{ guest_ttl_label }}；上传总容量：{{ total_upload_usage_label }}；上传完成后仅保留“服务器版”</p>
+    <input type="file" name="file" accept="{{ upload_accept }}" required>
+    <button type="submit">上传文件</button>
+    <p class="muted">单文件上限：{{ max_mb }} MB，支持 {{ upload_type_label }}；压缩包内的 .vpk 会批量处理；普通用户文件{{ guest_ttl_label }}；上传总容量：{{ total_upload_usage_label }}；上传完成后仅保留“服务器版”</p>
     <div class="upload-progress" hidden>
       <div class="upload-progress__meta">
         <span class="upload-progress__label">准备上传...</span>
@@ -24,6 +24,38 @@
       <summary>校验报告</summary>
       <pre>{{ report | tojson }}</pre>
     </details>
+  {% endif %}
+  {% if batch_results %}
+    <section class="batch-results">
+      <h3>批量上传结果</h3>
+      <p class="muted">成功 {{ batch_results.uploaded | length }} 个，失败 {{ batch_results.failed | length }} 个</p>
+      {% if batch_results.uploaded %}
+        <table class="table">
+          <thead>
+            <tr><th>文件名</th><th>大小(MB)</th><th>操作</th></tr>
+          </thead>
+          <tbody>
+            {% for item in batch_results.uploaded %}
+              <tr>
+                <td>{{ item.original_name }}</td>
+                <td>{{ item.size_label }}</td>
+                <td><a class="btn" href="/detail/{{ item.id }}">查看</a></td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% endif %}
+      {% if batch_results.failed %}
+        <details open>
+          <summary>失败列表</summary>
+          <ul class="batch-failures">
+            {% for item in batch_results.failed %}
+              <li><strong>{{ item.name }}</strong>：{{ item.error }}</li>
+            {% endfor %}
+          </ul>
+        </details>
+      {% endif %}
+    </section>
   {% endif %}
 </section>
 {% endblock %}
