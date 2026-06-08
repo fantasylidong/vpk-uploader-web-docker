@@ -2,7 +2,13 @@
 {% block content %}
 <section class="card">
   <h2>管理员面板</h2>
-  <form action="/admin/settings/guest-ttl" method="post" class="row settings-form">
+  <form action="/admin/settings" method="post" class="row settings-form">
+    <label>单文件上传上限（MB）
+      <input type="number" min="1" name="upload_max_mb" value="{{ max_mb }}" required>
+    </label>
+    <label>压缩包内 VPK 数量上限
+      <input type="number" min="1" name="archive_vpk_count" value="{{ archive_vpk_count }}" required>
+    </label>
     <label>普通用户保存时间（小时，0=永久）
       <input type="number" min="0" name="guest_ttl_hours" value="{{ guest_ttl_hours }}" required>
     </label>
@@ -10,7 +16,7 @@
       <input type="number" min="0" name="total_upload_limit_mb" value="{{ total_upload_limit_mb }}" required>
     </label>
     <button type="submit">保存设置</button>
-    <span class="muted">保存时间：{{ guest_ttl_label }}；容量：{{ total_upload_usage_label }}</span>
+    <span class="muted">单文件：{{ max_mb }} MB；压缩包 VPK：{{ archive_vpk_count }} 个；保存时间：{{ guest_ttl_label }}；容量：{{ total_upload_usage_label }}</span>
   </form>
   {% if settings_saved %}
     <div class="success">设置已更新</div>

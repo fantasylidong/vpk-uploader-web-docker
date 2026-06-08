@@ -2,13 +2,14 @@ import os
 import fnmatch
 import yaml
 from dataclasses import dataclass, asdict
-from typing import List, Dict
+from typing import List, Dict, Optional
 from vpk import VPK
 
 @dataclass
 class ValidationResult:
     ok: bool
     size_mb: float
+    max_size_mb: int
     required_present: List[str]
     missing_required: List[str]
     blocked_hits: List[str]
@@ -26,9 +27,9 @@ def _load_rules(path: str) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
-def validate_vpk(vpk_path: str, rules_path: str) -> ValidationResult:
+def validate_vpk(vpk_path: str, rules_path: str, max_size_mb_override: Optional[int] = None) -> ValidationResult:
     rules = _load_rules(rules_path)
-    max_size_mb = rules.get("max_size_mb", 600)
+    max_size_mb = max_size_mb_override if max_size_mb_override is not None else rules.get("max_size_mb", 600)
     require_files = [s.lower() for s in rules.get("require_files", [])]
     block_globs = [s.lower() for s in rules.get("block_globs", [])]
     warn_globs = [s.lower() for s in rules.get("warn_globs", [])]
@@ -59,6 +60,7 @@ def validate_vpk(vpk_path: str, rules_path: str) -> ValidationResult:
     return ValidationResult(
         ok=ok,
         size_mb=round(size_mb, 2),
+        max_size_mb=max_size_mb,
         required_present=required_present,
         missing_required=missing_required,
         blocked_hits=blocked_hits[:50],

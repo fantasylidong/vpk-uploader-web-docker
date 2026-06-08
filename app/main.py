@@ -24,9 +24,10 @@ from .db import init_db, SessionLocal, Upload, AppSetting
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret-change-me")
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "1024"))
+DEFAULT_MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "1024"))
 DEFAULT_TOTAL_UPLOAD_LIMIT_MB = int(os.getenv("MAX_TOTAL_UPLOAD_MB", "0"))
 DEFAULT_GUEST_TTL_HOURS = int(os.getenv("DEFAULT_GUEST_TTL_HOURS", "24"))
+UPLOAD_MAX_MB_SETTING_KEY = "upload_max_mb"
 TOTAL_UPLOAD_LIMIT_SETTING_KEY = "total_upload_limit_mb"
 GUEST_TTL_SETTING_KEY = "guest_ttl_hours"
 RULES_FILE = os.getenv("RULES_FILE", "rules.yml")
@@ -34,7 +35,8 @@ UPLOAD_EXTENSIONS = (".vpk", ".zip", ".rar", ".7z")
 ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z"}
 UPLOAD_ACCEPT = ",".join(UPLOAD_EXTENSIONS)
 UPLOAD_TYPE_LABEL = ".vpk / .zip / .rar / .7z"
-MAX_ARCHIVE_VPK_COUNT = int(os.getenv("MAX_ARCHIVE_VPK_COUNT", "50"))
+DEFAULT_MAX_ARCHIVE_VPK_COUNT = int(os.getenv("MAX_ARCHIVE_VPK_COUNT", "50"))
+ARCHIVE_VPK_COUNT_SETTING_KEY = "archive_vpk_count"
 ARCHIVE_LIST_TIMEOUT_SECONDS = int(os.getenv("ARCHIVE_LIST_TIMEOUT_SECONDS", "120"))
 ARCHIVE_EXTRACT_TIMEOUT_SECONDS = int(os.getenv("ARCHIVE_EXTRACT_TIMEOUT_SECONDS", "600"))
 
@@ -86,6 +88,10 @@ def _normalize_hours(hours: int) -> int:
 
 def _normalize_mb(mb: int) -> int:
     return max(0, int(mb))
+
+
+def _normalize_positive_int(value: int) -> int:
+    return max(1, int(value))
 
 
 def _format_mb(byte_count: int) -> str:
@@ -146,6 +152,21 @@ def set_guest_ttl_hours(hours: int) -> None:
     _set_int_setting(GUEST_TTL_SETTING_KEY, hours, _normalize_hours)
 
 
+def get_upload_max_mb(db=None) -> int:
+    own_db = db is None
+    if own_db:
+        db = SessionLocal()
+    try:
+        return _get_int_setting(db, UPLOAD_MAX_MB_SETTING_KEY, DEFAULT_MAX_UPLOAD_MB, _normalize_positive_int)
+    finally:
+        if own_db:
+            db.close()
+
+
+def set_upload_max_mb(max_mb: int) -> None:
+    _set_int_setting(UPLOAD_MAX_MB_SETTING_KEY, max_mb, _normalize_positive_int)
+
+
 def get_total_upload_limit_mb(db=None) -> int:
     own_db = db is None
     if own_db:
@@ -159,6 +180,26 @@ def get_total_upload_limit_mb(db=None) -> int:
 
 def set_total_upload_limit_mb(limit_mb: int) -> None:
     _set_int_setting(TOTAL_UPLOAD_LIMIT_SETTING_KEY, limit_mb, _normalize_mb)
+
+
+def get_archive_vpk_count(db=None) -> int:
+    own_db = db is None
+    if own_db:
+        db = SessionLocal()
+    try:
+        return _get_int_setting(
+            db,
+            ARCHIVE_VPK_COUNT_SETTING_KEY,
+            DEFAULT_MAX_ARCHIVE_VPK_COUNT,
+            _normalize_positive_int,
+        )
+    finally:
+        if own_db:
+            db.close()
+
+
+def set_archive_vpk_count(count: int) -> None:
+    _set_int_setting(ARCHIVE_VPK_COUNT_SETTING_KEY, count, _normalize_positive_int)
 
 
 def active_upload_usage_bytes(db) -> int:
@@ -250,9 +291,10 @@ def index_context(
     db = SessionLocal()
     try:
         guest_ttl_hours = get_guest_ttl_hours(db)
+        upload_max_mb = get_upload_max_mb(db)
         context = {
             "request": request,
-            "max_mb": MAX_UPLOAD_MB,
+            "max_mb": upload_max_mb,
             "upload_accept": UPLOAD_ACCEPT,
             "upload_type_label": UPLOAD_TYPE_LABEL,
             "guest_ttl_hours": guest_ttl_hours,
@@ -277,6 +319,8 @@ def admin_context(
     db = SessionLocal()
     try:
         guest_ttl_hours = get_guest_ttl_hours(db)
+        upload_max_mb = get_upload_max_mb(db)
+        archive_vpk_count = get_archive_vpk_count(db)
         query = db.query(Upload).order_by(Upload.created_at.desc())
         if q:
             like = f"%{q}%"
@@ -286,7 +330,8 @@ def admin_context(
             "request": request,
             "items": items,
             "q": q or "",
-            "max_mb": MAX_UPLOAD_MB,
+            "max_mb": upload_max_mb,
+            "archive_vpk_count": archive_vpk_count,
             "upload_accept": UPLOAD_ACCEPT,
             "upload_type_label": UPLOAD_TYPE_LABEL,
             "guest_ttl_hours": guest_ttl_hours,
@@ -417,7 +462,13 @@ def _list_archive_members(archive_path: str) -> list[str]:
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
 
-def _extract_archive_member_to_file(archive_path: str, member: str, dest_path: str, max_bytes: int) -> int:
+def _extract_archive_member_to_file(
+    archive_path: str,
+    member: str,
+    dest_path: str,
+    max_bytes: int,
+    max_mb: int,
+) -> int:
     cmd = [_bsdtar_path(), "-x", "-O", "-f", archive_path, "--", member]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stdout_fd = proc.stdout.fileno()
@@ -449,7 +500,7 @@ def _extract_archive_member_to_file(archive_path: str, member: str, dest_path: s
                         extracted_bytes += len(chunk)
                         if extracted_bytes > max_bytes:
                             proc.kill()
-                            raise HTTPException(status_code=400, detail=f"压缩包内的 VPK 解压后超过 {MAX_UPLOAD_MB} MB 限制")
+                            raise HTTPException(status_code=400, detail=f"压缩包内的 VPK 解压后超过 {max_mb} MB 限制")
                         out.write(chunk)
                     elif stderr_size < 8192:
                         stderr_chunks.append(chunk)
@@ -478,25 +529,25 @@ def _extract_archive_member_to_file(archive_path: str, member: str, dest_path: s
     return extracted_bytes
 
 
-def _archive_vpk_members(archive_path: str) -> list[str]:
+def _archive_vpk_members(archive_path: str, max_count: int) -> list[str]:
     members = _list_archive_members(archive_path)
     vpk_members = [member for member in members if _basename_only(member).lower().endswith(".vpk")]
 
     if not vpk_members:
         raise HTTPException(status_code=400, detail="压缩包中没有找到 .vpk 文件")
-    if len(vpk_members) > MAX_ARCHIVE_VPK_COUNT:
+    if len(vpk_members) > max_count:
         raise HTTPException(
             status_code=400,
-            detail=f"压缩包中包含 {len(vpk_members)} 个 .vpk，超过单次最多 {MAX_ARCHIVE_VPK_COUNT} 个限制",
+            detail=f"压缩包中包含 {len(vpk_members)} 个 .vpk，超过单次最多 {max_count} 个限制",
         )
 
     return vpk_members
 
 
-def _extract_archive_vpk_member(archive_path: str, archive_name: str, member: str, max_bytes: int):
+def _extract_archive_vpk_member(archive_path: str, archive_name: str, member: str, max_bytes: int, max_mb: int):
     vpk_name = _ensure_vpk_filename(member)
     tmp_vpk_path = os.path.join(TMP_DIR, f"{secrets.token_hex(6)}.vpk")
-    extracted_bytes = _extract_archive_member_to_file(archive_path, member, tmp_vpk_path, max_bytes)
+    extracted_bytes = _extract_archive_member_to_file(archive_path, member, tmp_vpk_path, max_bytes, max_mb)
 
     return tmp_vpk_path, vpk_name, {
         "source": "archive",
@@ -564,12 +615,13 @@ def _process_vpk_upload(
     source_vpk_name: str,
     upload_sha256: str,
     upload_source: dict,
+    upload_max_mb: int,
 ):
     display_name = _ensure_vpk_filename(source_vpk_name)
     work_base = _safe_base_no_ext(display_name)
 
     try:
-        vr: ValidationResult = validate_vpk(tmp_vpk_path, RULES_FILE)
+        vr: ValidationResult = validate_vpk(tmp_vpk_path, RULES_FILE, max_size_mb_override=upload_max_mb)
     except Exception as exc:
         _remove_file_quietly(tmp_vpk_path)
         raise HTTPException(status_code=400, detail=f"VPK 读取失败：{exc}")
@@ -818,7 +870,14 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
     original_name, upload_ext = _split_supported_upload(file.filename)
 
     # 2) 上传流写入系统 /tmp
-    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    db = SessionLocal()
+    try:
+        upload_max_mb = get_upload_max_mb(db)
+        archive_vpk_count = get_archive_vpk_count(db)
+    finally:
+        db.close()
+
+    max_bytes = upload_max_mb * 1024 * 1024
     tmp_upload_path = os.path.join(TMP_DIR, f"{secrets.token_hex(6)}{upload_ext}")
 
     read_bytes = 0
@@ -833,7 +892,7 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
             if read_bytes > max_bytes:
                 out.close()
                 _remove_file_quietly(tmp_upload_path)
-                raise HTTPException(status_code=400, detail=f"文件过大，超过 {MAX_UPLOAD_MB} MB 限制")
+                raise HTTPException(status_code=400, detail=f"文件过大，超过 {upload_max_mb} MB 限制")
             sha256.update(chunk)
             out.write(chunk)
 
@@ -844,7 +903,7 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
 
     try:
         if upload_ext in ARCHIVE_EXTENSIONS:
-            archive_members = _archive_vpk_members(tmp_upload_path)
+            archive_members = _archive_vpk_members(tmp_upload_path, archive_vpk_count)
             for index, member in enumerate(archive_members, start=1):
                 tmp_vpk_path = None
                 try:
@@ -853,6 +912,7 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
                         original_name,
                         member,
                         max_bytes,
+                        upload_max_mb,
                     )
                     upload_source.update({
                         "uploaded_size": read_bytes,
@@ -867,6 +927,7 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
                         source_vpk_name=source_vpk_name,
                         upload_sha256=upload_sha256,
                         upload_source=upload_source,
+                        upload_max_mb=upload_max_mb,
                     )
                     tmp_vpk_path = None
                     if up is not None:
@@ -895,6 +956,7 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
                 source_vpk_name=original_name,
                 upload_sha256=upload_sha256,
                 upload_source=upload_source,
+                upload_max_mb=upload_max_mb,
             )
             tmp_upload_path = None
             if up is not None:
@@ -961,17 +1023,25 @@ async def admin_home(request: Request):
     return templates.TemplateResponse("admin_dashboard.html", admin_context(request, q=q, settings_saved=settings_saved))
 
 
-@app.post("/admin/settings/guest-ttl")
-async def admin_set_guest_ttl(
+@app.post("/admin/settings")
+async def admin_set_settings(
     request: Request,
+    upload_max_mb: int = Form(...),
+    archive_vpk_count: int = Form(...),
     guest_ttl_hours: int = Form(...),
     total_upload_limit_mb: int = Form(...),
 ):
     require_admin(request)
+    if upload_max_mb < 1:
+        raise HTTPException(status_code=400, detail="单文件上传上限不能小于 1 MB")
+    if archive_vpk_count < 1:
+        raise HTTPException(status_code=400, detail="压缩包内 VPK 数量上限不能小于 1")
     if guest_ttl_hours < 0:
         raise HTTPException(status_code=400, detail="普通用户保存时间不能小于 0 小时")
     if total_upload_limit_mb < 0:
         raise HTTPException(status_code=400, detail="上传总容量限制不能小于 0 MB")
+    set_upload_max_mb(upload_max_mb)
+    set_archive_vpk_count(archive_vpk_count)
     set_guest_ttl_hours(guest_ttl_hours)
     set_total_upload_limit_mb(total_upload_limit_mb)
     return RedirectResponse(url="/admin?settings_saved=1", status_code=302)

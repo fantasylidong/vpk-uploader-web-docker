@@ -1,6 +1,7 @@
 # VPK Uploader（服务器版 Only + 中文下载修复 + 自动清理）
 
-- 支持 `.vpk`、`.zip`、`.rar`、`.7z` 上传；压缩包内的 `.vpk` 会批量合规校验并生成服务器版（默认单包最多 50 个，可用 `MAX_ARCHIVE_VPK_COUNT` 调整）。
+- 支持 `.vpk`、`.zip`、`.rar`、`.7z` 上传；压缩包内的 `.vpk` 会批量合规校验并生成服务器版。
+- 管理员后台可修改单文件上传上限、压缩包内 VPK 数量上限、普通用户保存时间、上传总容量；`MAX_UPLOAD_MB`、`MAX_ARCHIVE_VPK_COUNT`、`DEFAULT_GUEST_TTL_HOURS`、`MAX_TOTAL_UPLOAD_MB` 作为未保存后台设置时的默认值。
 - 无论管理员/普通用户：上传后**只保留服务器版**（解包→白名单筛选→重打包）。
 - **保留 `scripts/vscripts/**` 与 `missions/**`**，避免“没有模式/机关不触发”。
 - 下载端点使用 **RFC5987**（`filename*=`）修复**中文文件名 500**。
