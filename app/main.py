@@ -15,10 +15,10 @@ from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, Plai
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from itsdangerous import URLSafeSerializer, BadSignature
-from vpk import VPK
 
 from .vpkcheck import validate_vpk, ValidationResult
 from .vpk_tools import process_server_vpk
+from .vpk_reader import open_vpk
 from .db import init_db, SessionLocal, Upload, AppSetting
 
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret-change-me")
@@ -1127,7 +1127,7 @@ async def upload_files(item_id: int):
         db.close()
 
     try:
-        with VPK(path) as arch:
+        with open_vpk(path) as arch:
             files = sorted(str(rel).replace("\\", "/").lstrip("./") for rel in arch)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"读取 VPK 文件列表失败：{exc}")

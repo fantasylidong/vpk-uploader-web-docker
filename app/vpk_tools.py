@@ -1,7 +1,8 @@
 import os
 import shutil
 from typing import List, Dict
-from vpk import VPK
+
+from .vpk_reader import open_vpk
 from .thirdparty.l4d2_vpk_lib import NewVPK
 
 # 服务器保留白名单（包含 vscripts 与 missions，避免“没有模式/机关不触发”）
@@ -31,7 +32,7 @@ def extract_vpk_to_dir(vpk_path: str, out_dir: str) -> int:
     """解包 VPK 到目录，返回条目数量"""
     os.makedirs(out_dir, exist_ok=True)
     count = 0
-    with VPK(vpk_path) as arch:
+    with open_vpk(vpk_path) as arch:
         for rel in arch:  # 返回的是路径字符串
             norm_rel = _norm(rel)
             dst = os.path.join(out_dir, norm_rel)

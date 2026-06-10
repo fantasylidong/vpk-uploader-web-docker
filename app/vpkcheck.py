@@ -3,7 +3,8 @@ import fnmatch
 import yaml
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional
-from vpk import VPK
+
+from .vpk_reader import open_vpk
 
 @dataclass
 class ValidationResult:
@@ -36,7 +37,7 @@ def validate_vpk(vpk_path: str, rules_path: str, max_size_mb_override: Optional[
 
     size_mb = os.path.getsize(vpk_path) / (1024 * 1024)
 
-    with VPK(vpk_path) as arch:
+    with open_vpk(vpk_path) as arch:
         entries = [_norm(rel) for rel in arch]  # 注意：返回的是路径字符串
 
     file_count = len(entries)
