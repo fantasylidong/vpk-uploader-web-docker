@@ -8,6 +8,8 @@
 - 自带兜底清理：临时区 `data/tmp/`、构建残留 `_work_*`。
 - SFTP 直接放进 `/app/data/uploads` 的 `.vpk` 会自动登记为管理员上传，永久保存。
 - 提供 `/api/thirdparty-maps`，给 NewAnneWeb 查询当前可用图包清单。
+- 管理员登录后可进入 `/admin/docker`，查看全部容器的状态、CPU、内存、网络、磁盘 I/O、挂载信息和容器文件目录，并执行启动、停止、重启。
+- 可由 NewAnneWeb 聚合多个上传节点的文件、容量、Docker 信息和 srcds 状态；本项目提供受 Token 保护的 federation API。
 
 ## 本地构建
 ```bash
@@ -15,9 +17,28 @@ docker compose up -d --build
 # http://localhost:8080
 ```
 
+Docker 管理依赖将宿主机 `/var/run/docker.sock` 挂载到容器。仓库内的 Compose 文件已配置该挂载；它等同于授予应用宿主机 Docker 管理权限，请仅向可信管理员开放后台。
+
+## NewAnneWeb 聚合接入
+
+每个被管理节点设置自己的名称和一段高强度随机 Token：
+
+```env
+INSTANCE_NAME=上海节点
+FEDERATION_API_TOKEN=请替换为至少32字节的随机值
+```
+
+重启节点后，在 NewAnneWeb 的“三方图设置”中编辑对应上传入口，填写相同的 `FEDERATION_API_TOKEN`，再进入独立的“聚合管理”页面。NewAnneWeb 通过服务端请求节点 API，Token 不会发送到浏览器。每个节点建议使用不同 Token，并通过 HTTPS 连接。
+
+可用下面的命令生成 Token：
+
+```bash
+openssl rand -hex 32
+```
+
 ## 从 Docker Hub 运行
 ```bash
-docker run -d --name vpk-uploader -p 8080:8080   -e APP_SECRET="change-me" -e ADMIN_USER=admin -e ADMIN_PASS=admin123   -v /opt/vpk-uploader/data:/app/data   yourdockerhubname/vpk-uploader:latest
+docker run -d --name vpk-uploader -p 8080:8080   -e APP_SECRET="change-me" -e ADMIN_USER=admin -e ADMIN_PASS=admin123   -v /opt/vpk-uploader/data:/app/data   -v /var/run/docker.sock:/var/run/docker.sock   yourdockerhubname/vpk-uploader:latest
 ```
 
 ## GitHub Actions → Docker Hub

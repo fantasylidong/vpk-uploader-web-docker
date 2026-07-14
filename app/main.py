@@ -3,6 +3,7 @@ import hashlib
 import shutil
 import secrets
 import json
+import logging
 import time
 import select
 import subprocess
@@ -20,10 +21,15 @@ from .vpkcheck import validate_vpk, ValidationResult
 from .vpk_tools import process_server_vpk
 from .vpk_reader import open_vpk
 from .db import init_db, SessionLocal, Upload, AppSetting
+from .docker_manager import DockerManager
+from .aggregation import token_is_valid
 
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret-change-me")
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
+INSTANCE_NAME = os.getenv("INSTANCE_NAME", "VPK Uploader")
+FEDERATION_API_TOKEN = os.getenv("FEDERATION_API_TOKEN", "")
+logger = logging.getLogger("vpk_uploader")
 DEFAULT_MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "1024"))
 DEFAULT_TOTAL_UPLOAD_LIMIT_MB = int(os.getenv("MAX_TOTAL_UPLOAD_MB", "0"))
 DEFAULT_GUEST_TTL_HOURS = int(os.getenv("DEFAULT_GUEST_TTL_HOURS", "24"))
@@ -994,6 +1000,78 @@ def require_admin(request: Request):
     raise HTTPException(status_code=401, detail="需要管理员登录")
 
 
+def require_federation_token(request: Request) -> None:
+    if not FEDERATION_API_TOKEN:
+        raise HTTPException(status_code=503, detail="当前节点未配置 FEDERATION_API_TOKEN")
+    if not token_is_valid(request.headers.get("Authorization"), FEDERATION_API_TOKEN):
+        raise HTTPException(status_code=401, detail="节点 API Token 无效")
+
+
+def get_docker_manager() -> DockerManager:
+    try:
+        return DockerManager()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"无法连接 Docker：{exc}") from exc
+
+
+def delete_upload_item(item_id: int) -> None:
+    db = SessionLocal()
+    try:
+        item = db.get(Upload, item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="上传文件不存在")
+        path = os.path.join(UPLOAD_DIR, item.stored_name)
+        if os.path.exists(path):
+            os.remove(path)
+        item.status = "deleted"
+        db.commit()
+    finally:
+        db.close()
+
+
+def federation_summary_payload() -> dict:
+    db = SessionLocal()
+    try:
+        items = (
+            db.query(Upload)
+            .filter(Upload.status == "active")
+            .order_by(Upload.created_at.desc())
+            .limit(50)
+            .all()
+        )
+        site = {
+            "name": INSTANCE_NAME,
+            "upload_count": db.query(Upload).filter(Upload.status == "active").count(),
+            **storage_context(db),
+        }
+        uploads = [{
+            "id": item.id,
+            "name": item.original_name,
+            "size": item.size or 0,
+            "role": item.role,
+            "created_at": item.created_at.isoformat() if item.created_at else None,
+            "expires_at": item.expires_at.isoformat() if item.expires_at else None,
+            "detail_path": f"/detail/{item.id}",
+            "download_path": f"/d/{item.id}",
+        } for item in items]
+    finally:
+        db.close()
+
+    containers = []
+    docker_error = None
+    try:
+        containers = get_docker_manager().list_containers()
+    except Exception as exc:
+        docker_error = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+    return {
+        "generated_at": now_utc().isoformat(),
+        "site": site,
+        "uploads": uploads,
+        "containers": containers,
+        "docker_error": docker_error,
+    }
+
+
 @app.get("/admin/login", response_class=HTMLResponse)
 async def admin_login_page(request: Request):
     return templates.TemplateResponse("admin_login.html", {"request": request})
@@ -1021,6 +1099,125 @@ async def admin_home(request: Request):
     q = request.query_params.get("q")
     settings_saved = request.query_params.get("settings_saved") == "1"
     return templates.TemplateResponse("admin_dashboard.html", admin_context(request, q=q, settings_saved=settings_saved))
+
+
+@app.get("/admin/docker", response_class=HTMLResponse)
+async def docker_dashboard(request: Request):
+    require_admin(request)
+    return templates.TemplateResponse("docker_dashboard.html", {"request": request})
+
+
+@app.get("/api/admin/docker/containers")
+async def docker_containers(request: Request):
+    require_admin(request)
+    try:
+        items = get_docker_manager().list_containers()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"读取 Docker 数据失败：{exc}") from exc
+    return {"generated_at": now_utc().isoformat(), "containers": items}
+
+
+@app.post("/api/admin/docker/containers/{container_id}/exec")
+async def docker_container_exec(request: Request, container_id: str):
+    require_admin(request)
+    try:
+        payload = await request.json()
+        command = str(payload.get("command", "")) if isinstance(payload, dict) else ""
+        result = get_docker_manager().exec_command(container_id, command)
+        logger.info("admin docker exec container=%s exit=%s", container_id, result["exit_code"])
+        return {"ok": True, **result}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"容器命令执行失败：{exc}") from exc
+
+
+@app.post("/api/admin/docker/containers/{container_id}/{action}")
+async def docker_container_action(request: Request, container_id: str, action: str):
+    require_admin(request)
+    try:
+        get_docker_manager().action(container_id, action)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"容器操作失败：{exc}") from exc
+    return {"ok": True, "action": action}
+
+
+@app.get("/api/admin/docker/containers/{container_id}/files")
+async def docker_container_files(request: Request, container_id: str, path: str = "/"):
+    require_admin(request)
+    try:
+        return get_docker_manager().list_files(container_id, path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"读取容器文件失败：{exc}") from exc
+
+
+@app.get("/api/federation/summary")
+def federation_summary(request: Request):
+    require_federation_token(request)
+    return federation_summary_payload()
+
+
+@app.post("/api/federation/docker/{container_id}/exec")
+async def federation_docker_exec(request: Request, container_id: str):
+    require_federation_token(request)
+    try:
+        payload = await request.json()
+        command = str(payload.get("command", "")) if isinstance(payload, dict) else ""
+        result = get_docker_manager().exec_command(container_id, command)
+        logger.info("federation docker exec container=%s exit=%s", container_id, result["exit_code"])
+        return {"ok": True, **result}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"容器命令执行失败：{exc}") from exc
+
+
+@app.post("/api/federation/docker/{container_id}/{action}")
+def federation_docker_action(request: Request, container_id: str, action: str):
+    require_federation_token(request)
+    try:
+        get_docker_manager().action(container_id, action)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"容器操作失败：{exc}") from exc
+    return {"ok": True, "action": action}
+
+
+@app.get("/api/federation/docker/{container_id}/files")
+def federation_docker_files(request: Request, container_id: str, path: str = "/"):
+    require_federation_token(request)
+    try:
+        return get_docker_manager().list_files(container_id, path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"读取容器文件失败：{exc}") from exc
+
+
+@app.post("/api/federation/uploads/{item_id}/delete")
+def federation_upload_delete(request: Request, item_id: int):
+    require_federation_token(request)
+    delete_upload_item(item_id)
+    return {"ok": True}
 
 
 @app.post("/admin/settings")
@@ -1076,18 +1273,7 @@ async def admin_set_expiry(request: Request, item_id: int, hours: int = Form(...
 @app.post("/admin/delete/{item_id}")
 async def admin_delete(request: Request, item_id: int):
     require_admin(request)
-    db = SessionLocal()
-    try:
-        item = db.get(Upload, item_id)
-        if not item:
-            raise HTTPException(status_code=404)
-        path = os.path.join(UPLOAD_DIR, item.stored_name)
-        if os.path.exists(path):
-            os.remove(path)
-        item.status = "deleted"
-        db.commit()
-    finally:
-        db.close()
+    delete_upload_item(item_id)
     return RedirectResponse(url="/admin", status_code=302)
 
 

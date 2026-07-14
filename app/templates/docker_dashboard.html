@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="docker-page" data-docker-dashboard>
+  <div class="page-heading">
+    <div><h2>Docker 管理</h2><p class="muted">容器状态、资源占用和文件目录</p></div>
+    <div class="row"><button type="button" data-refresh>刷新</button><a class="btn secondary" href="/admin">返回文件管理</a></div>
+  </div>
+  <div class="error" data-error hidden></div>
+  <div class="docker-summary" data-summary></div>
+  <div class="container-grid" data-containers><p class="muted">正在读取 Docker 数据...</p></div>
+</section>
+<dialog class="file-dialog" data-file-dialog>
+  <div class="page-heading"><div><h3 data-file-title>容器文件</h3><code data-current-path>/</code></div><button type="button" class="secondary" data-close>关闭</button></div>
+  <div class="row file-toolbar"><button type="button" class="secondary" data-parent>上级目录</button><button type="button" data-file-refresh>刷新</button></div>
+  <div class="file-listing" data-files></div>
+</dialog>
+<script src="/static/docker-dashboard.js" defer></script>
+{% endblock %}

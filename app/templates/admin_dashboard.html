@@ -1,7 +1,10 @@
 {% extends "base.html" %}
 {% block content %}
 <section class="card">
-  <h2>管理员面板</h2>
+  <div class="page-heading">
+    <div><h2>管理员面板</h2><p class="muted">上传文件与容量设置</p></div>
+    <a class="btn secondary" href="/admin/docker">本机 Docker</a>
+  </div>
   <form action="/admin/settings" method="post" class="row settings-form">
     <label>单文件上传上限（MB）
       <input type="number" min="1" name="upload_max_mb" value="{{ max_mb }}" required>

@@ -1,4 +1,3 @@
-version: "3.9"
 services:
   uploader:
     image: ${DOCKER_IMAGE:-yourdockerhubname/vpk-uploader:latest}
@@ -11,8 +10,11 @@ services:
       - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-1024}
       - DEFAULT_GUEST_TTL_HOURS=${DEFAULT_GUEST_TTL_HOURS:-24}
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - INSTANCE_NAME=${INSTANCE_NAME:-VPK Uploader}
+      - FEDERATION_API_TOKEN=${FEDERATION_API_TOKEN:-}
       - TZ=${TZ:-Asia/Shanghai}
     volumes:
       - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
       # - ./rules.yml:/app/rules.yml:ro
     restart: unless-stopped
