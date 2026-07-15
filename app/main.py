@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import FastAPI, Request, UploadFile, Form, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, PlainTextResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from itsdangerous import URLSafeSerializer, BadSignature
@@ -22,13 +22,14 @@ from .vpk_tools import process_server_vpk
 from .vpk_reader import open_vpk
 from .db import init_db, SessionLocal, Upload, AppSetting
 from .docker_manager import DockerManager
-from .aggregation import token_is_valid
+from .aggregation import client_ip_is_allowed, token_is_valid
 
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret-change-me")
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
 INSTANCE_NAME = os.getenv("INSTANCE_NAME", "VPK Uploader")
 FEDERATION_API_TOKEN = os.getenv("FEDERATION_API_TOKEN", "")
+FEDERATION_ALLOWED_CIDRS = os.getenv("FEDERATION_ALLOWED_CIDRS", "")
 logger = logging.getLogger("vpk_uploader")
 DEFAULT_MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "1024"))
 DEFAULT_TOTAL_UPLOAD_LIMIT_MB = int(os.getenv("MAX_TOTAL_UPLOAD_MB", "0"))
@@ -871,7 +872,13 @@ async def index(request: Request):
     return templates.TemplateResponse("index.html", index_context(request))
 
 
-async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hours: Optional[int]):
+async def _handle_upload(
+    request: Request,
+    file: UploadFile,
+    role: str,
+    ttl_hours: Optional[int],
+    render_error: bool = True,
+):
     # 1) 文件名校验：允许直接上传 VPK，或上传包含多个 VPK 的压缩包。
     original_name, upload_ext = _split_supported_upload(file.filename)
 
@@ -980,7 +987,8 @@ async def _handle_upload(request: Request, file: UploadFile, role: str, ttl_hour
 
     first_failure = failed[0] if failed else {"error": "没有成功处理任何 VPK"}
     report = first_failure.get("report")
-    return [], results, upload_error_response(request, role, first_failure["error"], report=report)
+    response = upload_error_response(request, role, first_failure["error"], report=report) if render_error else None
+    return [], results, response
 
 
 @app.post("/upload")
@@ -1003,6 +1011,10 @@ def require_admin(request: Request):
 def require_federation_token(request: Request) -> None:
     if not FEDERATION_API_TOKEN:
         raise HTTPException(status_code=503, detail="当前节点未配置 FEDERATION_API_TOKEN")
+    client_ip = request.client.host if request.client else ""
+    if not client_ip_is_allowed(client_ip, FEDERATION_ALLOWED_CIDRS):
+        logger.warning("federation request denied source=%s", client_ip or "unknown")
+        raise HTTPException(status_code=403, detail="当前来源地址不允许访问节点聚合 API")
     if not token_is_valid(request.headers.get("Authorization"), FEDERATION_API_TOKEN):
         raise HTTPException(status_code=401, detail="节点 API Token 无效")
 
@@ -1167,6 +1179,26 @@ async def docker_container_files(request: Request, container_id: str, path: str 
 def federation_summary(request: Request):
     require_federation_token(request)
     return federation_summary_payload()
+
+
+@app.post("/api/federation/uploads")
+async def federation_upload(request: Request, file: UploadFile):
+    require_federation_token(request)
+    uploads, results, _ = await _handle_upload(
+        request,
+        file,
+        role="admin",
+        ttl_hours=None,
+        render_error=False,
+    )
+    if not uploads:
+        failed = results.get("failed", [])
+        detail = failed[0].get("error", "没有成功处理任何 VPK") if failed else "没有成功处理任何 VPK"
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "detail": detail, **results},
+        )
+    return {"ok": True, **results}
 
 
 @app.post("/api/federation/docker/{container_id}/exec")

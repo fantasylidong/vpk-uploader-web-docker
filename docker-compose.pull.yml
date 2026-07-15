@@ -12,6 +12,7 @@ services:
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
       - INSTANCE_NAME=${INSTANCE_NAME:-VPK Uploader}
       - FEDERATION_API_TOKEN=${FEDERATION_API_TOKEN:-}
+      - FEDERATION_ALLOWED_CIDRS=${FEDERATION_ALLOWED_CIDRS:-}
       - TZ=${TZ:-Asia/Shanghai}
     volumes:
       - ./data:/app/data

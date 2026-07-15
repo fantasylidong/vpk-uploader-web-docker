@@ -9,9 +9,10 @@ services:
       - ADMIN_PASS=admin123
       - MAX_UPLOAD_MB=1024
       - DEFAULT_GUEST_TTL_HOURS=24
-      - PUBLIC_BASE_URL=http://localhost:8080
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
       - INSTANCE_NAME=${INSTANCE_NAME:-本机节点}
       - FEDERATION_API_TOKEN=${FEDERATION_API_TOKEN:-}
+      - FEDERATION_ALLOWED_CIDRS=${FEDERATION_ALLOWED_CIDRS:-}
       - TZ=Asia/Shanghai
     volumes:
       - ./data:/app/data
