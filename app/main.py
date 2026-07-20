@@ -1,3 +1,4 @@
+import asyncio
 import os
 import fcntl
 import hashlib
@@ -5,6 +6,7 @@ import shutil
 import secrets
 import json
 import logging
+import threading
 import time
 import select
 import subprocess
@@ -60,6 +62,7 @@ ARCHIVE_EXTRACT_TIMEOUT_SECONDS = int(os.getenv("ARCHIVE_EXTRACT_TIMEOUT_SECONDS
 TMP_MAX_AGE_MIN = int(os.getenv("TMP_MAX_AGE_MIN", "30"))
 WORK_MAX_AGE_MIN = int(os.getenv("WORK_MAX_AGE_MIN", "60"))
 SFTP_IMPORT_MIN_AGE_SECONDS = int(os.getenv("SFTP_IMPORT_MIN_AGE_SECONDS", "30"))
+SFTP_SCAN_INTERVAL_SECONDS = max(5, int(os.getenv("SFTP_SCAN_INTERVAL_SECONDS", "60")))
 
 BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.getenv("DATA_DIR", os.path.join(os.path.dirname(BASE_DIR), "data"))
@@ -80,6 +83,8 @@ templates.env.filters['tojson'] = lambda v: json.dumps(v, ensure_ascii=False, in
 
 signer = URLSafeSerializer(APP_SECRET, salt="session")
 init_db()
+_sftp_scan_lock = threading.Lock()
+_sftp_scan_task: Optional[asyncio.Task] = None
 
 
 def now_utc() -> datetime:
@@ -811,83 +816,147 @@ def _file_newer_than_upload_record(stat: os.stat_result, upload: Upload) -> bool
     return stat.st_mtime > created_at.timestamp() + 1
 
 
-def sync_sftp_uploads(now_ts: Optional[float] = None):
+def sync_sftp_uploads(now_ts: Optional[float] = None) -> dict[str, int | bool]:
     """把 SFTP 放进 uploads 的 .vpk 登记为管理员上传，避免被当作无主文件处理。"""
+    stats: dict[str, int | bool] = {
+        "scanned": 0,
+        "imported": 0,
+        "updated": 0,
+        "existing": 0,
+        "deferred": 0,
+        "errors": 0,
+        "busy": False,
+    }
+    if not _sftp_scan_lock.acquire(blocking=False):
+        stats["busy"] = True
+        return stats
+
     if now_ts is None:
         now_ts = time.time()
 
-    db = SessionLocal()
+    db = None
     try:
+        db = SessionLocal()
         by_name = {row.stored_name: row for row in db.query(Upload).all()}
-        changed = False
-
-        for name in os.listdir(UPLOAD_DIR):
+        for name in sorted(os.listdir(UPLOAD_DIR)):
             if not name.lower().endswith(".vpk"):
                 continue
 
             path = os.path.join(UPLOAD_DIR, name)
             if not os.path.isfile(path):
                 continue
+            stats["scanned"] += 1
 
             try:
                 stat = os.stat(path)
             except OSError:
+                stats["errors"] += 1
                 continue
 
             if now_ts - stat.st_mtime < SFTP_IMPORT_MIN_AGE_SECONDS:
+                stats["deferred"] += 1
                 continue
 
             existing = by_name.get(name)
-            if existing and not _file_newer_than_upload_record(stat, existing):
+            if existing and existing.status == "active" and not _file_newer_than_upload_record(stat, existing):
+                stats["existing"] += 1
                 continue
 
-            imported_at = now_utc()
-            file_sha256 = _sha256_file(path)
-            report = {
-                "validation": {
-                    "ok": True,
-                    "source": "sftp",
-                    "message": "SFTP 上传按管理员上传处理，未经过网页端校验和重打包。",
-                },
-                "sftp_import": {
-                    "imported_at": imported_at.isoformat(),
-                    "mtime": stat.st_mtime,
-                    "note": "SFTP 上传文件按管理员上传处理，未经过网页端重打包。",
+            try:
+                imported_at = now_utc()
+                file_sha256 = _sha256_file(path)
+                final_stat = os.stat(path)
+                if final_stat.st_size != stat.st_size or final_stat.st_mtime_ns != stat.st_mtime_ns:
+                    stats["deferred"] += 1
+                    continue
+                report = {
+                    "validation": {
+                        "ok": True,
+                        "source": "sftp",
+                        "message": "SFTP 上传按管理员上传处理，未经过网页端校验和重打包。",
+                    },
+                    "sftp_import": {
+                        "imported_at": imported_at.isoformat(),
+                        "mtime": stat.st_mtime,
+                        "note": "SFTP 上传文件按管理员上传处理，未经过网页端重打包。",
+                    }
                 }
-            }
+                if existing:
+                    existing.original_name = name
+                    existing.sha256 = file_sha256
+                    existing.size = stat.st_size
+                    existing.role = "admin"
+                    existing.created_at = imported_at
+                    existing.expires_at = None
+                    existing.vpk_valid = True
+                    existing.vpk_report = json.dumps(report, ensure_ascii=False)
+                    existing.status = "active"
+                    existing.uploader_ip = "sftp"
+                    stats["updated"] += 1
+                else:
+                    existing = Upload(
+                        original_name=name,
+                        stored_name=name,
+                        sha256=file_sha256,
+                        size=stat.st_size,
+                        role="admin",
+                        created_at=imported_at,
+                        expires_at=None,
+                        vpk_valid=True,
+                        vpk_report=json.dumps(report, ensure_ascii=False),
+                        status="active",
+                        uploader_ip="sftp",
+                    )
+                    db.add(existing)
+                    stats["imported"] += 1
 
-            if existing:
-                existing.original_name = name
-                existing.sha256 = file_sha256
-                existing.size = stat.st_size
-                existing.role = "admin"
-                existing.created_at = imported_at
-                existing.expires_at = None
-                existing.vpk_valid = True
-                existing.vpk_report = json.dumps(report, ensure_ascii=False)
-                existing.status = "active"
-                existing.uploader_ip = "sftp"
-            else:
-                db.add(Upload(
-                    original_name=name,
-                    stored_name=name,
-                    sha256=file_sha256,
-                    size=stat.st_size,
-                    role="admin",
-                    created_at=imported_at,
-                    expires_at=None,
-                    vpk_valid=True,
-                    vpk_report=json.dumps(report, ensure_ascii=False),
-                    status="active",
-                    uploader_ip="sftp",
-                ))
+                db.commit()
+                by_name[name] = existing
+            except Exception:
+                db.rollback()
+                stats["errors"] += 1
+                logger.exception("Failed to import SFTP VPK: %s", name)
 
-            changed = True
-
-        if changed:
-            db.commit()
+        return stats
     finally:
-        db.close()
+        if db is not None:
+            db.close()
+        _sftp_scan_lock.release()
+
+
+async def _sftp_sync_loop() -> None:
+    while True:
+        try:
+            stats = await asyncio.to_thread(sync_sftp_uploads)
+            if stats["imported"] or stats["updated"] or stats["errors"]:
+                logger.info("SFTP upload scan completed: %s", stats)
+            await asyncio.sleep(SFTP_SCAN_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("SFTP upload scan failed")
+            await asyncio.sleep(SFTP_SCAN_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+async def start_sftp_sync() -> None:
+    global _sftp_scan_task
+    if _sftp_scan_task is None or _sftp_scan_task.done():
+        _sftp_scan_task = asyncio.create_task(_sftp_sync_loop())
+
+
+@app.on_event("shutdown")
+async def stop_sftp_sync() -> None:
+    global _sftp_scan_task
+    task = _sftp_scan_task
+    _sftp_scan_task = None
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 def cleanup_expired():
@@ -968,13 +1037,6 @@ def cleanup_tmp_and_work():
                 _remove_file_quietly(path)
     except Exception:
         pass
-
-    # SFTP 直接放进 uploads 的 .vpk 等同管理员上传：自动登记、永久保存。
-    try:
-        sync_sftp_uploads(now_ts)
-    except Exception:
-        pass
-
 
 @app.middleware("http")
 async def tidy_mw(request: Request, call_next):

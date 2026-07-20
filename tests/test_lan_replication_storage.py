@@ -135,6 +135,54 @@ class LanReplicationStorageTest(unittest.TestCase):
         main.cleanup_tmp_and_work()
         self.assertFalse(os.path.exists(partial_path))
 
+    def test_sftp_scan_imports_existing_vpk_once(self):
+        path = os.path.join(main.UPLOAD_DIR, "sftp-map.vpk")
+        with open(path, "wb") as handle:
+            handle.write(b"existing-vpk")
+        old_time = main.time.time() - main.SFTP_IMPORT_MIN_AGE_SECONDS - 1
+        os.utime(path, (old_time, old_time))
+
+        first = main.sync_sftp_uploads()
+        second = main.sync_sftp_uploads()
+
+        self.assertEqual(first["imported"], 1)
+        self.assertEqual(first["errors"], 0)
+        self.assertEqual(second["imported"], 0)
+        self.assertEqual(second["existing"], 1)
+
+        db = SessionLocal()
+        try:
+            uploads = db.query(Upload).filter(Upload.stored_name == "sftp-map.vpk").all()
+            self.assertEqual(len(uploads), 1)
+            self.assertEqual(uploads[0].role, "admin")
+            self.assertEqual(uploads[0].status, "active")
+            self.assertIsNone(uploads[0].expires_at)
+            self.assertEqual(uploads[0].sha256, hashlib.sha256(b"existing-vpk").hexdigest())
+        finally:
+            db.close()
+
+    def test_sftp_scan_defers_file_changed_while_hashing(self):
+        path = os.path.join(main.UPLOAD_DIR, "changing.vpk")
+        with open(path, "wb") as handle:
+            handle.write(b"first")
+        old_time = main.time.time() - main.SFTP_IMPORT_MIN_AGE_SECONDS - 1
+        os.utime(path, (old_time, old_time))
+
+        def change_during_hash(file_path):
+            with open(file_path, "ab") as handle:
+                handle.write(b"-changed")
+            return hashlib.sha256(b"first").hexdigest()
+
+        with patch.object(main, "_sha256_file", side_effect=change_during_hash):
+            stats = main.sync_sftp_uploads()
+
+        self.assertEqual(stats["deferred"], 1)
+        db = SessionLocal()
+        try:
+            self.assertEqual(db.query(Upload).filter(Upload.stored_name == "changing.vpk").count(), 0)
+        finally:
+            db.close()
+
     def test_preflight_skips_node_when_quota_is_too_small(self):
         main.set_total_upload_limit_mb(1)
         db = SessionLocal()

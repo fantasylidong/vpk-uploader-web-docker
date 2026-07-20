@@ -6,7 +6,7 @@
 - **保留 `scripts/vscripts/**` 与 `missions/**`**，避免“没有模式/机关不触发”。
 - 下载端点使用 **RFC5987**（`filename*=`）修复**中文文件名 500**。
 - 自带兜底清理：临时区 `data/tmp/`、构建残留 `_work_*`。
-- SFTP 直接放进 `/app/data/uploads` 的 `.vpk` 会自动登记为管理员上传，永久保存。
+- SFTP 直接放进 `/app/data/uploads` 的 `.vpk` 会自动登记为管理员上传，永久保存。上传器启动后会在后台立即扫描，并默认每 60 秒补扫一次；扫描逐文件提交且可重复执行，不会阻塞健康检查和聚合 API。
 - 提供 `/api/thirdparty-maps`，给 NewAnneWeb 查询当前可用图包清单。
 - 管理员登录后可进入 `/admin/docker`，查看全部容器的状态、CPU、内存、网络、磁盘 I/O、挂载信息和容器文件目录，并执行启动、停止、重启。
 - 可由 NewAnneWeb 聚合多个上传节点的文件、容量、Docker 信息和 srcds 状态；本项目提供受 Token 保护的 federation API。
@@ -94,6 +94,8 @@ docker run -d --name vpk-uploader -p 8080:8080   -e APP_SECRET="change-me" -e AD
 ## 目录说明
 - `/app/data/uploads`：最终服务器版 VPK；也可通过 SFTP 直接放入 `.vpk`，系统会按管理员上传自动登记
 - `/app/data/tmp`：上传临时文件（流程结束即删，附兜底清理）
+
+`SFTP_IMPORT_MIN_AGE_SECONDS` 默认是 30 秒，避免登记仍在写入的文件；`SFTP_SCAN_INTERVAL_SECONDS` 默认是 60 秒，可调整后台补扫间隔，最小为 5 秒。
 
 ## NewAnneWeb 对接接口
 上传服务只负责告诉 NewAnneWeb 当前有哪些可用图包，不维护“哪些服务器安装了哪些图”。服务器维度由 NewAnneWeb 自己处理。
