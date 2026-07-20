@@ -10,6 +10,7 @@
 - 提供 `/api/thirdparty-maps`，给 NewAnneWeb 查询当前可用图包清单。
 - 管理员登录后可进入 `/admin/docker`，查看全部容器的状态、CPU、内存、网络、磁盘 I/O、挂载信息和容器文件目录，并执行启动、停止、重启。
 - 可由 NewAnneWeb 聚合多个上传节点的文件、容量、Docker 信息和 srcds 状态；本项目提供受 Token 保护的 federation API。
+- 聚合上传可以按内网组自动复制：公网文件只进入一个种子节点，种子节点生成服务器版 VPK 后通过内网同步到同组节点；容量不足的节点会跳过，不影响其他节点。
 
 ## 本地构建
 ```bash
@@ -30,6 +31,49 @@ FEDERATION_ALLOWED_CIDRS=NewAnneWeb服务器公网IP/32
 ```
 
 重启节点后，在 NewAnneWeb 的“三方图设置”中编辑对应上传入口，填写相同的 `FEDERATION_API_TOKEN`，再进入独立的“聚合管理”页面。NewAnneWeb 通过服务端请求节点 API，Token 不会发送到浏览器。每个节点建议使用不同 Token。
+
+### 同内网上传一次并分发
+
+内网复制只会由 `POST /api/federation/uploads` 触发。普通用户的 `/upload`、管理员后台上传和 SFTP 导入仍只写入当前节点，不会意外扩散。
+
+同组节点需要配置相同的 `LAN_GROUP` 和 `LAN_PEER_API_TOKEN`，每台机器使用不同的 `LAN_NODE_ID`，并在 `LAN_PEERS` 中填写其他机器的内网地址。上传器不会根据公网 IP 猜测内网；只有配置为同组、Token 验证通过、节点 ID 匹配且内网地址实际可达时才会复制。
+
+例如三台机器的内网地址分别是 `10.20.0.11`、`10.20.0.12`、`10.20.0.13`，节点 A 的 `.env` 可以写成：
+
+```env
+LAN_REPLICATION_ENABLED=1
+LAN_NODE_ID=shanghai-a
+LAN_GROUP=shanghai-lan
+LAN_PEER_API_TOKEN=请替换为至少32字符的同组随机密钥
+LAN_PEER_ALLOWED_CIDRS=10.20.0.0/24
+LAN_PEERS=[{"id":"shanghai-b","name":"上海 B","url":"http://10.20.0.12:8080"},{"id":"shanghai-c","name":"上海 C","url":"http://10.20.0.13:8080"}]
+LAN_DISK_RESERVE_MB=1024
+```
+
+节点 B、C 使用各自的 `LAN_NODE_ID`，并把另外两台机器写进 `LAN_PEERS`。这样无论 NewAnneWeb 选择哪台作为上传入口，它都能成为本次种子节点。
+
+安全和容量规则：
+
+- `LAN_PEER_API_TOKEN` 是内网组共享密钥，至少 32 个字符；不要与每个节点自己的 `FEDERATION_API_TOKEN` 共用。
+- `LAN_PEER_ALLOWED_CIDRS` 必填，应用只读取 TCP 来源地址，不信任 `X-Forwarded-For`。如果中间经过反向代理，填写代理实际连接上传器时使用的内网地址。
+- `LAN_PEERS` 默认只允许 IP 字面量或域名解析到私网、回环或链路本地地址。确需跨公网复制时才能设置 `LAN_ALLOW_PUBLIC_PEERS=1`，并应同时使用 HTTPS。
+- `LAN_DISK_RESERVE_MB` 默认保留 1024 MB 物理磁盘空间。节点可用容量取“后台上传总配额剩余”和“物理磁盘安全余量”的较小值。
+- 接收节点先按最终服务器版 VPK 的确切大小申请持久化容量预留，再传输文件。预留期间本地上传也会计入这部分空间，避免并发超额。
+- 文件使用 SHA-256 去重和校验，写入完成前使用隐藏临时文件，校验通过后原子改名。已经存在的文件不会重复占用空间。
+- 一个节点容量不足时返回 `skipped_capacity`，种子节点仍会继续同步其他节点。网络失败和容量跳过都会写入 federation 上传响应的 `replication.peers`。
+
+相关可选项：
+
+```env
+LAN_PEER_CONNECT_TIMEOUT_SECONDS=4
+LAN_PEER_TRANSFER_TIMEOUT_SECONDS=1800
+LAN_RESERVATION_TTL_SECONDS=3600
+LAN_REPLICATION_RETRIES=1
+LAN_MAX_PARALLEL_PEERS=3
+LAN_PEER_TLS_VERIFY=1
+```
+
+内网复制接口位于 `/api/lan/replication/`，不使用 federation Token。不要把这些接口放到不受防火墙约束的公网入口。
 
 没有域名或 HTTPS 时，可以直接填写 `http://公网IP:端口`。此时必须把 `FEDERATION_ALLOWED_CIDRS` 配成 NewAnneWeb 的固定出口公网 IP，例如 `203.0.113.8/32`；多台管理端可以用逗号分隔。节点只读取 TCP 连接来源，不信任 `X-Forwarded-For`。这种方式可以阻止其他公网地址访问聚合 API，但 HTTP 内容仍是明文，不要在容器命令或 RCON 命令中直接输入新的密码、Token 等敏感值。
 

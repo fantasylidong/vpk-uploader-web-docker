@@ -1,4 +1,5 @@
 import os
+import fcntl
 import hashlib
 import shutil
 import secrets
@@ -7,9 +8,10 @@ import logging
 import time
 import select
 import subprocess
+from contextlib import contextmanager
 from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, Request, UploadFile, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, PlainTextResponse, JSONResponse
@@ -20,9 +22,15 @@ from itsdangerous import URLSafeSerializer, BadSignature
 from .vpkcheck import validate_vpk, ValidationResult
 from .vpk_tools import process_server_vpk
 from .vpk_reader import open_vpk
-from .db import init_db, SessionLocal, Upload, AppSetting
+from .db import init_db, SessionLocal, Upload, AppSetting, ReplicationReservation
 from .docker_manager import DockerManager
 from .aggregation import client_ip_is_allowed, token_is_valid
+from .lan_replication import (
+    PROTOCOL_VERSION,
+    ReplicationArtifact,
+    load_lan_replication_config,
+    replicate_artifacts,
+)
 
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret-change-me")
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
@@ -30,6 +38,7 @@ ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
 INSTANCE_NAME = os.getenv("INSTANCE_NAME", "VPK Uploader")
 FEDERATION_API_TOKEN = os.getenv("FEDERATION_API_TOKEN", "")
 FEDERATION_ALLOWED_CIDRS = os.getenv("FEDERATION_ALLOWED_CIDRS", "")
+LAN_REPLICATION = load_lan_replication_config()
 logger = logging.getLogger("vpk_uploader")
 DEFAULT_MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "1024"))
 DEFAULT_TOTAL_UPLOAD_LIMIT_MB = int(os.getenv("MAX_TOTAL_UPLOAD_MB", "0"))
@@ -53,7 +62,7 @@ WORK_MAX_AGE_MIN = int(os.getenv("WORK_MAX_AGE_MIN", "60"))
 SFTP_IMPORT_MIN_AGE_SECONDS = int(os.getenv("SFTP_IMPORT_MIN_AGE_SECONDS", "30"))
 
 BASE_DIR = os.path.dirname(__file__)
-DATA_DIR = os.path.join(os.path.dirname(BASE_DIR), "data")
+DATA_DIR = os.getenv("DATA_DIR", os.path.join(os.path.dirname(BASE_DIR), "data"))
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
@@ -62,6 +71,7 @@ TMP_DIR = os.getenv("TMP_DIR", "/tmp")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(TMP_DIR, exist_ok=True)
+CAPACITY_LOCK_PATH = os.path.join(DATA_DIR, ".capacity.lock")
 
 app = FastAPI(title="VPK Uploader")
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
@@ -214,8 +224,73 @@ def active_upload_usage_bytes(db) -> int:
     return sum((size or 0) for (size,) in rows)
 
 
-def storage_context(db) -> dict:
+@contextmanager
+def capacity_guard():
+    lock_fd = os.open(CAPACITY_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def _expire_replication_reservations(db) -> bool:
+    changed = False
+    current = now_utc()
+    rows = db.query(ReplicationReservation).filter(
+        ReplicationReservation.status == "active"
+    ).all()
+    for row in rows:
+        expires_at = _as_aware_utc(row.expires_at)
+        if expires_at is not None and expires_at <= current:
+            row.status = "expired"
+            row.reserved_bytes = 0
+            changed = True
+    return changed
+
+
+def active_replication_reserved_bytes(db) -> int:
+    changed = _expire_replication_reservations(db)
+    rows = db.query(ReplicationReservation.reserved_bytes).filter(
+        ReplicationReservation.status == "active"
+    ).all()
+    if changed:
+        db.commit()
+    return sum(max(0, reserved or 0) for (reserved,) in rows)
+
+
+def replication_storage_snapshot(db) -> dict[str, Any]:
     used_bytes = active_upload_usage_bytes(db)
+    reserved_bytes = active_replication_reserved_bytes(db)
+    limit_mb = get_total_upload_limit_mb(db)
+    limit_bytes = limit_mb * 1024 * 1024
+    disk_free_bytes = shutil.disk_usage(UPLOAD_DIR).free
+    disk_available_bytes = max(
+        0,
+        disk_free_bytes - LAN_REPLICATION.disk_reserve_bytes - reserved_bytes,
+    )
+    quota_available_bytes = None
+    if limit_bytes > 0:
+        quota_available_bytes = max(0, limit_bytes - used_bytes - reserved_bytes)
+    available_bytes = disk_available_bytes
+    if quota_available_bytes is not None:
+        available_bytes = min(available_bytes, quota_available_bytes)
+    return {
+        "limit_bytes": limit_bytes,
+        "used_bytes": used_bytes,
+        "reserved_bytes": reserved_bytes,
+        "quota_available_bytes": quota_available_bytes,
+        "disk_free_bytes": disk_free_bytes,
+        "disk_reserve_bytes": LAN_REPLICATION.disk_reserve_bytes,
+        "available_bytes": available_bytes,
+    }
+
+
+def storage_context(db) -> dict:
+    snapshot = replication_storage_snapshot(db)
+    used_bytes = int(snapshot["used_bytes"])
+    reserved_bytes = int(snapshot["reserved_bytes"])
     limit_mb = get_total_upload_limit_mb(db)
     limit_bytes = limit_mb * 1024 * 1024
     usage_percent = 0
@@ -234,9 +309,13 @@ def storage_context(db) -> dict:
         "total_upload_limit_label": total_upload_limit_label(limit_mb),
         "total_upload_limit_bytes": limit_bytes,
         "total_upload_used_bytes": used_bytes,
+        "total_upload_reserved_bytes": reserved_bytes,
+        "total_upload_available_bytes": int(snapshot["available_bytes"]),
         "total_upload_used_label": _format_mb(used_bytes),
         "total_upload_usage_label": usage_label,
         "total_upload_usage_percent": usage_percent,
+        "disk_free_bytes": int(snapshot["disk_free_bytes"]),
+        "disk_reserve_bytes": int(snapshot["disk_reserve_bytes"]),
     }
 
 
@@ -378,14 +457,16 @@ def total_capacity_error(db, new_file_size: int) -> Optional[str]:
 
     limit_bytes = limit_mb * 1024 * 1024
     used_bytes = active_upload_usage_bytes(db)
-    if used_bytes + new_file_size <= limit_bytes:
+    reserved_bytes = active_replication_reserved_bytes(db)
+    if used_bytes + reserved_bytes + new_file_size <= limit_bytes:
         return None
 
-    remaining_bytes = max(0, limit_bytes - used_bytes)
+    remaining_bytes = max(0, limit_bytes - used_bytes - reserved_bytes)
+    reserved_detail = f"，复制预留 {_format_mb(reserved_bytes)}" if reserved_bytes else ""
     return (
         "上传失败：已超过上传总容量限制。"
         f"总容量上限 {total_upload_limit_label(limit_mb)}，"
-        f"当前已用 {_format_mb(used_bytes)}，"
+        f"当前已用 {_format_mb(used_bytes)}{reserved_detail}，"
         f"剩余 {_format_mb(remaining_bytes)}，"
         f"本次生成文件 {_format_mb(new_file_size)}。"
     )
@@ -595,11 +676,32 @@ def _upload_item_result(up: Upload) -> dict:
         "id": up.id,
         "original_name": up.original_name,
         "stored_name": up.stored_name,
+        "sha256": up.sha256,
         "size": up.size,
         "size_label": _format_mb(up.size or 0),
         "detail_url": f"/detail/{up.id}",
         "download_url": f"/d/{up.id}",
     }
+
+
+def _find_active_upload_by_sha256(db, sha256: str, size: int) -> Optional[Upload]:
+    candidates = db.query(Upload).filter(
+        Upload.status == "active",
+        Upload.size == size,
+    ).all()
+    for item in candidates:
+        path = os.path.join(UPLOAD_DIR, item.stored_name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            actual_sha256 = _sha256_file(path)
+        except OSError:
+            continue
+        if actual_sha256 == sha256:
+            item.sha256 = sha256
+            db.flush()
+            return item
+    return None
 
 
 def _expiry_for_upload(db, role: str, ttl_hours: Optional[int]) -> Optional[datetime]:
@@ -657,31 +759,42 @@ def _process_vpk_upload(
 
         server_path = os.path.join(UPLOAD_DIR, final_name)
         server_size = os.path.getsize(server_path) if os.path.exists(server_path) else 0
-        capacity_error = total_capacity_error(db, server_size)
-        if capacity_error:
-            _remove_file_quietly(server_path)
-            return None, {"name": display_name, "error": capacity_error}
-
+        server_sha256 = _sha256_file(server_path)
+        upload_source = {**upload_source, "uploaded_sha256": upload_sha256}
         report = {"upload_source": upload_source, "validation": vr.to_dict(), "server_build": build_report}
 
-        up = Upload(
-            original_name=display_name,
-            stored_name=final_name,
-            sha256=upload_sha256,
-            size=server_size,
-            role=role,
-            created_at=now_utc(),
-            expires_at=expires_at,
-            vpk_valid=True,
-            vpk_report=json.dumps(report, ensure_ascii=False),
-            status="active",
-            uploader_ip=request.client.host if request.client else None,
-        )
-        db.add(up)
-        db.commit()
-        db.refresh(up)
-        result = _upload_item_result(up)
-        return up, result
+        with capacity_guard():
+            existing = _find_active_upload_by_sha256(db, server_sha256, server_size)
+            if existing is not None:
+                _remove_file_quietly(server_path)
+                db.commit()
+                result = _upload_item_result(existing)
+                result["deduplicated"] = True
+                return existing, result
+
+            capacity_error = total_capacity_error(db, server_size)
+            if capacity_error:
+                _remove_file_quietly(server_path)
+                return None, {"name": display_name, "error": capacity_error}
+
+            up = Upload(
+                original_name=display_name,
+                stored_name=final_name,
+                sha256=server_sha256,
+                size=server_size,
+                role=role,
+                created_at=now_utc(),
+                expires_at=expires_at,
+                vpk_valid=True,
+                vpk_report=json.dumps(report, ensure_ascii=False),
+                status="active",
+                uploader_ip=request.client.host if request.client else None,
+            )
+            db.add(up)
+            db.commit()
+            db.refresh(up)
+            result = _upload_item_result(up)
+            return up, result
     except Exception:
         if final_name:
             _remove_file_quietly(os.path.join(UPLOAD_DIR, final_name))
@@ -806,6 +919,26 @@ def cleanup_expired():
         db.close()
 
 
+def cleanup_replication_reservations():
+    db = SessionLocal()
+    try:
+        with capacity_guard():
+            changed = _expire_replication_reservations(db)
+            cutoff = now_utc() - timedelta(hours=24)
+            rows = db.query(ReplicationReservation).filter(
+                ReplicationReservation.status != "active"
+            ).all()
+            for row in rows:
+                created_at = _as_aware_utc(row.created_at)
+                if created_at is not None and created_at < cutoff:
+                    db.delete(row)
+                    changed = True
+            if changed:
+                db.commit()
+    finally:
+        db.close()
+
+
 def cleanup_tmp_and_work():
     now_ts = time.time()
 
@@ -824,6 +957,18 @@ def cleanup_tmp_and_work():
     except Exception:
         pass
 
+    # 接收内网复制时先写隐藏分片；进程被强制终止后由这里清理孤立文件。
+    try:
+        max_partial_age = max(WORK_MAX_AGE_MIN * 60, LAN_REPLICATION.reservation_ttl_seconds)
+        for name in os.listdir(UPLOAD_DIR):
+            if not (name.startswith(".lan-") and name.endswith(".part")):
+                continue
+            path = os.path.join(UPLOAD_DIR, name)
+            if os.path.isfile(path) and now_ts - os.path.getmtime(path) > max_partial_age:
+                _remove_file_quietly(path)
+    except Exception:
+        pass
+
     # SFTP 直接放进 uploads 的 .vpk 等同管理员上传：自动登记、永久保存。
     try:
         sync_sftp_uploads(now_ts)
@@ -835,6 +980,7 @@ def cleanup_tmp_and_work():
 async def tidy_mw(request: Request, call_next):
     cleanup_tmp_and_work()
     cleanup_expired()
+    cleanup_replication_reservations()
     response = await call_next(request)
     return response
 
@@ -1019,6 +1165,230 @@ def require_federation_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="节点 API Token 无效")
 
 
+def require_lan_peer(request: Request) -> str:
+    if not LAN_REPLICATION.receiver_enabled:
+        raise HTTPException(status_code=503, detail="当前节点未启用内网复制接收接口")
+    client_ip = request.client.host if request.client else ""
+    if not client_ip_is_allowed(client_ip, LAN_REPLICATION.allowed_cidrs):
+        logger.warning("lan replication request denied source=%s", client_ip or "unknown")
+        raise HTTPException(status_code=403, detail="当前来源地址不允许访问内网复制接口")
+    if not token_is_valid(request.headers.get("Authorization"), LAN_REPLICATION.token):
+        raise HTTPException(status_code=401, detail="内网复制 Token 无效")
+    if not secrets.compare_digest(request.headers.get("X-LAN-Group", ""), LAN_REPLICATION.group):
+        raise HTTPException(status_code=409, detail="内网组不一致")
+    source_node_id = request.headers.get("X-LAN-Node", "").strip()
+    if not source_node_id or len(source_node_id) > 128:
+        raise HTTPException(status_code=400, detail="来源节点 ID 无效")
+    return source_node_id
+
+
+def _valid_sha256(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _replication_manifest_items(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="复制预检请求必须是 JSON 对象")
+    raw_items = payload.get("artifacts", [])
+    if not isinstance(raw_items, list) or not raw_items or len(raw_items) > 50:
+        raise HTTPException(status_code=400, detail="复制文件清单数量必须在 1 到 50 之间")
+
+    db = SessionLocal()
+    try:
+        max_bytes = get_upload_max_mb(db) * 1024 * 1024
+    finally:
+        db.close()
+
+    items: list[dict[str, Any]] = []
+    seen_hashes: set[str] = set()
+    for index, raw_item in enumerate(raw_items, start=1):
+        if not isinstance(raw_item, dict):
+            raise HTTPException(status_code=400, detail=f"复制文件清单第 {index} 项无效")
+        original_name = _ensure_vpk_filename(str(raw_item.get("original_name", "")))
+        stored_name = _ensure_vpk_filename(str(raw_item.get("stored_name", original_name)))
+        sha256 = str(raw_item.get("sha256", "")).strip().lower()
+        try:
+            size = int(raw_item.get("size", 0))
+            source_upload_id = int(raw_item.get("source_upload_id", 0))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"复制文件清单第 {index} 项大小或 ID 无效") from exc
+        if not _valid_sha256(sha256):
+            raise HTTPException(status_code=400, detail=f"复制文件清单第 {index} 项 SHA-256 无效")
+        if sha256 in seen_hashes:
+            raise HTTPException(status_code=400, detail=f"复制文件清单第 {index} 项重复")
+        if size < 1 or size > max_bytes:
+            raise HTTPException(status_code=400, detail=f"复制文件 {original_name} 大小超出单文件限制")
+        if source_upload_id < 1:
+            raise HTTPException(status_code=400, detail=f"复制文件 {original_name} 来源 ID 无效")
+        seen_hashes.add(sha256)
+        items.append({
+            "source_upload_id": source_upload_id,
+            "original_name": original_name,
+            "stored_name": stored_name,
+            "size": size,
+            "sha256": sha256,
+            "status": "pending",
+        })
+    return items
+
+
+def _load_reservation_manifest(row: ReplicationReservation) -> dict[str, Any]:
+    try:
+        payload = json.loads(row.manifest)
+    except (TypeError, ValueError):
+        payload = None
+    if not isinstance(payload, dict) or not isinstance(payload.get("artifacts"), list):
+        raise HTTPException(status_code=500, detail="容量预留记录损坏")
+    return payload
+
+
+def _save_reservation_manifest(row: ReplicationReservation, manifest: dict[str, Any]) -> None:
+    row.manifest = json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))
+
+
+def _reservation_item(
+    row: ReplicationReservation,
+    sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    manifest = _load_reservation_manifest(row)
+    for item in manifest["artifacts"]:
+        if isinstance(item, dict) and str(item.get("sha256", "")) == sha256:
+            return manifest, item
+    raise HTTPException(status_code=404, detail="容量预留中没有这个文件")
+
+
+def _public_replication_storage(snapshot: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "limit_bytes": int(snapshot["limit_bytes"]),
+        "used_bytes": int(snapshot["used_bytes"]),
+        "reserved_bytes": int(snapshot["reserved_bytes"]),
+        "available_bytes": int(snapshot["available_bytes"]),
+        "disk_free_bytes": int(snapshot["disk_free_bytes"]),
+        "disk_reserve_bytes": int(snapshot["disk_reserve_bytes"]),
+    }
+
+
+def _replication_preflight(source_node_id: str, payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="复制预检请求必须是 JSON 对象")
+    if str(payload.get("source_node_id", "")).strip() != source_node_id:
+        raise HTTPException(status_code=400, detail="来源节点 ID 与请求头不一致")
+    if str(payload.get("lan_group", "")).strip() != LAN_REPLICATION.group:
+        raise HTTPException(status_code=409, detail="内网组不一致")
+    items = _replication_manifest_items(payload)
+    requested_ttl = payload.get("reservation_ttl_seconds", LAN_REPLICATION.reservation_ttl_seconds)
+    try:
+        ttl_seconds = int(requested_ttl)
+    except (TypeError, ValueError):
+        ttl_seconds = LAN_REPLICATION.reservation_ttl_seconds
+    ttl_seconds = max(300, min(LAN_REPLICATION.reservation_ttl_seconds, ttl_seconds))
+
+    db = SessionLocal()
+    try:
+        with capacity_guard():
+            already_present = []
+            missing = []
+            for item in items:
+                existing = _find_active_upload_by_sha256(db, item["sha256"], item["size"])
+                if existing is None:
+                    missing.append(item)
+                else:
+                    already_present.append(_upload_item_result(existing))
+            db.commit()
+
+            snapshot = replication_storage_snapshot(db)
+            required_bytes = sum(int(item["size"]) for item in missing)
+            if not missing:
+                return {
+                    "ok": True,
+                    "status": "already_present",
+                    "required_bytes": 0,
+                    "accepted": [],
+                    "already_present": already_present,
+                    "storage": _public_replication_storage(snapshot),
+                }
+            if required_bytes > int(snapshot["available_bytes"]):
+                return {
+                    "ok": True,
+                    "status": "insufficient_capacity",
+                    "detail": "目标节点容量不足，已跳过本次内网复制。",
+                    "required_bytes": required_bytes,
+                    "accepted": [],
+                    "already_present": already_present,
+                    "storage": _public_replication_storage(snapshot),
+                }
+
+            reservation_id = secrets.token_hex(24)
+            created_at = now_utc()
+            manifest = {
+                "source_node_id": source_node_id,
+                "artifacts": missing,
+            }
+            db.add(ReplicationReservation(
+                id=reservation_id,
+                source_node_id=source_node_id,
+                lan_group=LAN_REPLICATION.group,
+                manifest=json.dumps(manifest, ensure_ascii=False, separators=(",", ":")),
+                reserved_bytes=required_bytes,
+                created_at=created_at,
+                expires_at=created_at + timedelta(seconds=ttl_seconds),
+                status="active",
+            ))
+            db.commit()
+            snapshot = replication_storage_snapshot(db)
+            return {
+                "ok": True,
+                "status": "reserved",
+                "reservation_id": reservation_id,
+                "expires_at": (created_at + timedelta(seconds=ttl_seconds)).isoformat(),
+                "required_bytes": required_bytes,
+                "accepted": [{key: item[key] for key in ("sha256", "size", "original_name")} for item in missing],
+                "already_present": already_present,
+                "storage": _public_replication_storage(snapshot),
+            }
+    finally:
+        db.close()
+
+
+def _ensure_active_reservation(
+    db,
+    reservation_id: str,
+    source_node_id: str,
+) -> ReplicationReservation:
+    row = db.get(ReplicationReservation, reservation_id)
+    if row is None or row.source_node_id != source_node_id or row.lan_group != LAN_REPLICATION.group:
+        raise HTTPException(status_code=404, detail="容量预留不存在")
+    expires_at = _as_aware_utc(row.expires_at)
+    if row.status != "active" or expires_at is None or expires_at <= now_utc():
+        if row.status == "active":
+            row.status = "expired"
+            row.reserved_bytes = 0
+            db.commit()
+        raise HTTPException(status_code=409, detail="容量预留已经失效")
+    return row
+
+
+def _replication_artifacts_for_uploads(uploads: list[Upload]) -> list[ReplicationArtifact]:
+    artifacts: list[ReplicationArtifact] = []
+    for upload in uploads:
+        path = os.path.join(UPLOAD_DIR, upload.stored_name)
+        if not os.path.isfile(path):
+            logger.error("replication source file missing upload_id=%s path=%s", upload.id, path)
+            continue
+        sha256 = str(upload.sha256 or "").lower()
+        if not _valid_sha256(sha256):
+            sha256 = _sha256_file(path)
+        artifacts.append(ReplicationArtifact(
+            upload_id=int(upload.id),
+            original_name=str(upload.original_name),
+            stored_name=str(upload.stored_name),
+            path=path,
+            size=int(upload.size or os.path.getsize(path)),
+            sha256=sha256,
+        ))
+    return artifacts
+
+
 def get_docker_manager() -> DockerManager:
     try:
         return DockerManager()
@@ -1041,6 +1411,192 @@ def delete_upload_item(item_id: int) -> None:
         db.close()
 
 
+async def receive_lan_replication_upload(
+    request: Request,
+    source_node_id: str,
+    reservation_id: str,
+    source_upload_id: int,
+    original_name: str,
+    expected_sha256: str,
+    expected_size: int,
+    file: UploadFile,
+) -> dict[str, Any]:
+    reservation_id = reservation_id.strip().lower()
+    expected_sha256 = expected_sha256.strip().lower()
+    original_name = _ensure_vpk_filename(original_name)
+    if len(reservation_id) != 48 or not all(character in "0123456789abcdef" for character in reservation_id):
+        raise HTTPException(status_code=400, detail="容量预留 ID 无效")
+    if not _valid_sha256(expected_sha256):
+        raise HTTPException(status_code=400, detail="复制文件 SHA-256 无效")
+    if expected_size < 1 or source_upload_id < 1:
+        raise HTTPException(status_code=400, detail="复制文件大小或来源 ID 无效")
+    _ensure_vpk_filename(file.filename or "upload.vpk")
+
+    db = SessionLocal()
+    try:
+        row = _ensure_active_reservation(db, reservation_id, source_node_id)
+        _, item = _reservation_item(row, expected_sha256)
+        if (
+            int(item.get("source_upload_id", 0)) != source_upload_id
+            or str(item.get("original_name", "")) != original_name
+            or int(item.get("size", 0)) != expected_size
+        ):
+            raise HTTPException(status_code=409, detail="复制文件与容量预留清单不一致")
+        if str(item.get("status", "")) != "pending":
+            target_upload_id = int(item.get("target_upload_id", 0))
+            existing = db.get(Upload, target_upload_id) if target_upload_id else None
+            return {
+                "ok": True,
+                "status": "already_present",
+                "upload": _upload_item_result(existing) if existing else {
+                    "original_name": original_name,
+                    "sha256": expected_sha256,
+                    "size": expected_size,
+                },
+            }
+    finally:
+        db.close()
+
+    tmp_path = os.path.join(UPLOAD_DIR, f".lan-{secrets.token_hex(12)}.part")
+    read_bytes = 0
+    digest = hashlib.sha256()
+    try:
+        with open(tmp_path, "xb") as output:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                read_bytes += len(chunk)
+                if read_bytes > expected_size:
+                    raise HTTPException(status_code=400, detail="复制文件大小超过预留值")
+                digest.update(chunk)
+                output.write(chunk)
+        if read_bytes != expected_size:
+            raise HTTPException(status_code=400, detail="复制文件大小与预留值不一致")
+        if not secrets.compare_digest(digest.hexdigest(), expected_sha256):
+            raise HTTPException(status_code=400, detail="复制文件 SHA-256 校验失败")
+
+        try:
+            validation: ValidationResult = validate_vpk(
+                tmp_path,
+                RULES_FILE,
+                max_size_mb_override=get_upload_max_mb(),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"复制的 VPK 读取失败：{exc}") from exc
+        if not validation.ok:
+            raise HTTPException(status_code=400, detail="复制的 VPK 不符合当前节点规则")
+
+        final_path = ""
+        db = SessionLocal()
+        try:
+            with capacity_guard():
+                row = _ensure_active_reservation(db, reservation_id, source_node_id)
+                manifest, item = _reservation_item(row, expected_sha256)
+                if str(item.get("status", "")) != "pending":
+                    target_upload_id = int(item.get("target_upload_id", 0))
+                    existing = db.get(Upload, target_upload_id) if target_upload_id else None
+                    return {
+                        "ok": True,
+                        "status": "already_present",
+                        "upload": _upload_item_result(existing) if existing else {
+                            "original_name": original_name,
+                            "sha256": expected_sha256,
+                            "size": expected_size,
+                        },
+                    }
+
+                existing = _find_active_upload_by_sha256(db, expected_sha256, expected_size)
+                if existing is not None:
+                    item["status"] = "already_present"
+                    item["target_upload_id"] = existing.id
+                    row.reserved_bytes = max(0, int(row.reserved_bytes or 0) - expected_size)
+                    _save_reservation_manifest(row, manifest)
+                    db.commit()
+                    return {
+                        "ok": True,
+                        "status": "already_present",
+                        "upload": _upload_item_result(existing),
+                    }
+
+                work_base = _safe_base_no_ext(original_name)
+                final_name = _unique_server_filename(db, work_base)
+                final_path = os.path.join(UPLOAD_DIR, final_name)
+                os.replace(tmp_path, final_path)
+
+                report = {
+                    "upload_source": {
+                        "source": "lan_replication",
+                        "source_node_id": source_node_id,
+                        "source_upload_id": source_upload_id,
+                        "received_sha256": expected_sha256,
+                        "received_size": expected_size,
+                    },
+                    "validation": validation.to_dict(),
+                    "replication": {
+                        "lan_group": LAN_REPLICATION.group,
+                        "received_at": now_utc().isoformat(),
+                    },
+                }
+                upload = Upload(
+                    original_name=original_name,
+                    stored_name=final_name,
+                    sha256=expected_sha256,
+                    size=expected_size,
+                    role="admin",
+                    created_at=now_utc(),
+                    expires_at=None,
+                    vpk_valid=True,
+                    vpk_report=json.dumps(report, ensure_ascii=False),
+                    status="active",
+                    uploader_ip=f"lan:{source_node_id}"[:64],
+                )
+                db.add(upload)
+                db.flush()
+                item["status"] = "stored"
+                item["target_upload_id"] = upload.id
+                row.reserved_bytes = max(0, int(row.reserved_bytes or 0) - expected_size)
+                _save_reservation_manifest(row, manifest)
+                db.commit()
+                db.refresh(upload)
+                return {"ok": True, "status": "stored", "upload": _upload_item_result(upload)}
+        except Exception:
+            if final_path:
+                _remove_file_quietly(final_path)
+            db.rollback()
+            raise
+        finally:
+            db.close()
+    finally:
+        _remove_file_quietly(tmp_path)
+
+
+def complete_lan_replication_reservation(source_node_id: str, reservation_id: str) -> dict[str, Any]:
+    db = SessionLocal()
+    try:
+        with capacity_guard():
+            row = db.get(ReplicationReservation, reservation_id)
+            if row is None or row.source_node_id != source_node_id or row.lan_group != LAN_REPLICATION.group:
+                raise HTTPException(status_code=404, detail="容量预留不存在")
+            manifest = _load_reservation_manifest(row)
+            pending_count = 0
+            for item in manifest["artifacts"]:
+                if isinstance(item, dict) and item.get("status") == "pending":
+                    item["status"] = "released"
+                    pending_count += 1
+            row.reserved_bytes = 0
+            row.status = "completed" if pending_count == 0 else "partial"
+            _save_reservation_manifest(row, manifest)
+            db.commit()
+            return {
+                "ok": True,
+                "status": row.status,
+                "released_item_count": pending_count,
+            }
+    finally:
+        db.close()
+
+
 def federation_summary_payload() -> dict:
     db = SessionLocal()
     try:
@@ -1054,6 +1610,7 @@ def federation_summary_payload() -> dict:
         site = {
             "name": INSTANCE_NAME,
             "upload_count": db.query(Upload).filter(Upload.status == "active").count(),
+            "lan_replication": LAN_REPLICATION.public_status(),
             **storage_context(db),
         }
         uploads = [{
@@ -1181,6 +1738,66 @@ def federation_summary(request: Request):
     return federation_summary_payload()
 
 
+@app.get("/api/lan/replication/capabilities")
+def lan_replication_capabilities(request: Request):
+    require_lan_peer(request)
+    db = SessionLocal()
+    try:
+        storage = _public_replication_storage(replication_storage_snapshot(db))
+    finally:
+        db.close()
+    return {
+        "ok": True,
+        "protocol_version": PROTOCOL_VERSION,
+        "node_id": LAN_REPLICATION.node_id,
+        "lan_group": LAN_REPLICATION.group,
+        "instance_name": INSTANCE_NAME,
+        "storage": storage,
+    }
+
+
+@app.post("/api/lan/replication/preflight")
+async def lan_replication_preflight(request: Request):
+    source_node_id = require_lan_peer(request)
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="复制预检请求不是合法 JSON") from exc
+    return _replication_preflight(source_node_id, payload)
+
+
+@app.post("/api/lan/replication/uploads")
+async def lan_replication_upload(
+    request: Request,
+    file: UploadFile,
+    reservation_id: str = Form(...),
+    source_node_id: str = Form(...),
+    source_upload_id: int = Form(...),
+    original_name: str = Form(...),
+    sha256: str = Form(...),
+    size: int = Form(...),
+):
+    authenticated_source = require_lan_peer(request)
+    if source_node_id.strip() != authenticated_source:
+        raise HTTPException(status_code=400, detail="来源节点 ID 与请求头不一致")
+    return await receive_lan_replication_upload(
+        request=request,
+        source_node_id=authenticated_source,
+        reservation_id=reservation_id,
+        source_upload_id=source_upload_id,
+        original_name=original_name,
+        expected_sha256=sha256,
+        expected_size=size,
+        file=file,
+    )
+
+
+@app.post("/api/lan/replication/reservations/{reservation_id}/complete")
+def lan_replication_complete(request: Request, reservation_id: str):
+    source_node_id = require_lan_peer(request)
+    return complete_lan_replication_reservation(source_node_id, reservation_id.strip().lower())
+
+
 @app.post("/api/federation/uploads")
 async def federation_upload(request: Request, file: UploadFile):
     require_federation_token(request)
@@ -1198,7 +1815,17 @@ async def federation_upload(request: Request, file: UploadFile):
             status_code=400,
             content={"ok": False, "detail": detail, **results},
         )
-    return {"ok": True, **results}
+    artifacts = _replication_artifacts_for_uploads(uploads)
+    replication = await replicate_artifacts(LAN_REPLICATION, artifacts)
+    logger.info(
+        "lan replication source=%s peers=%s completed=%s skipped=%s failed=%s",
+        LAN_REPLICATION.node_id or "disabled",
+        len(replication.get("peers", [])),
+        replication.get("completed_peer_count", 0),
+        replication.get("skipped_peer_count", 0),
+        replication.get("failed_peer_count", 0),
+    )
+    return {"ok": True, **results, "replication": replication}
 
 
 @app.post("/api/federation/docker/{container_id}/exec")
