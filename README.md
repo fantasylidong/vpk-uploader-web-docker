@@ -1,6 +1,7 @@
 # VPK Uploader（服务器版 Only + 中文下载修复 + 自动清理）
 
 - 支持 `.vpk`、`.zip`、`.rar`、`.7z` 上传；压缩包内的 `.vpk` 会批量合规校验并生成服务器版。
+- 浏览器默认使用 4 路并发分片上传，网络中断或页面刷新后可续传；原有整包上传接口继续保留。
 - 管理员后台可修改单文件上传上限、压缩包内 VPK 数量上限、普通用户保存时间、上传总容量；`MAX_UPLOAD_MB`、`MAX_ARCHIVE_VPK_COUNT`、`DEFAULT_GUEST_TTL_HOURS`、`MAX_TOTAL_UPLOAD_MB` 作为未保存后台设置时的默认值。
 - 无论管理员/普通用户：上传后**只保留服务器版**（解包→白名单筛选→重打包）。
 - **保留 `scripts/vscripts/**` 与 `missions/**`**，避免“没有模式/机关不触发”。
@@ -17,6 +18,23 @@
 docker compose up -d --build
 # http://localhost:8080
 ```
+
+## 并发分片与断点续传
+
+浏览器上传会先建立带随机凭据的上传会话，再按 8 MB 分片并发传输。已确认写入的分片不会重复发送；网络中断或页面刷新后，在同一浏览器重新选择同一个未修改的文件即可继续。完成处理的结果也可重复查询，避免响应丢失时重复生成服务器版文件。
+
+未完成会话保存在持久化目录 `/app/data/upload_sessions`，默认 48 小时过期。上传成功后会立即删除分片，仅保留很小的完成状态；点击“取消”会立即删除整个会话。管理员上传会话的每个请求都会重新检查管理员登录态。
+
+```env
+CHUNK_UPLOAD_SIZE_MB=8
+CHUNK_UPLOAD_PARALLELISM=4
+CHUNK_UPLOAD_MAX_AGE_HOURS=48
+CHUNK_UPLOAD_DISK_RESERVE_MB=512
+CHUNK_UPLOAD_MAX_ACTIVE_SESSIONS=64
+CHUNK_UPLOAD_MAX_SESSIONS_PER_CLIENT=4
+```
+
+并发数限制在 1–8，分片大小限制在 1–32 MB。进行中的会话按完整源文件大小计入上传总容量，并预留 `CHUNK_UPLOAD_DISK_RESERVE_MB` 指定的物理磁盘空间；默认最多同时保留 64 个未完成会话、同一来源最多 4 个。反向代理需要允许 `PUT`、`DELETE`，且单请求 body 上限不能低于分片大小。
 
 Docker 管理依赖将宿主机 `/var/run/docker.sock` 挂载到容器。仓库内的 Compose 文件已配置该挂载；它等同于授予应用宿主机 Docker 管理权限，请仅向可信管理员开放后台。
 
@@ -94,6 +112,7 @@ docker run -d --name vpk-uploader -p 8080:8080   -e APP_SECRET="change-me" -e AD
 ## 目录说明
 - `/app/data/uploads`：最终服务器版 VPK；也可通过 SFTP 直接放入 `.vpk`，系统会按管理员上传自动登记
 - `/app/data/tmp`：上传临时文件（流程结束即删，附兜底清理）
+- `/app/data/upload_sessions`：断点续传会话与未完成分片（自动过期清理）
 
 `SFTP_IMPORT_MIN_AGE_SECONDS` 默认是 30 秒，避免登记仍在写入的文件；`SFTP_SCAN_INTERVAL_SECONDS` 默认是 60 秒，可调整后台补扫间隔，最小为 5 秒。
 

@@ -1,12 +1,18 @@
 {% extends "base.html" %}
+{% block title %}管理员登录 · VPK Uploader{% endblock %}
+{% block body_class %}page-admin page-auth{% endblock %}
 {% block content %}
-<section class="card">
-  <h2>管理员登录</h2>
-  <form action="/admin/login" method="post">
-    <label>用户名 <input name="username" autocomplete="username" required></label>
-    <label>密码 <input type="password" name="password" autocomplete="current-password" required></label>
-    <button type="submit">登录</button>
-    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+<section class="auth-shell">
+  <div class="auth-intro">
+    <div class="format-stamp" aria-hidden="true">VPK</div>
+    <h1>管理员登录</h1>
+    <p>文件与服务器控制台</p>
+  </div>
+  <form action="/admin/login" method="post" class="auth-form">
+    <label class="field"><span class="field-label">用户名</span><input name="username" autocomplete="username" required></label>
+    <label class="field"><span class="field-label">密码</span><input type="password" name="password" autocomplete="current-password" required></label>
+    <button class="primary-action" type="submit">登录</button>
+    {% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
   </form>
 </section>
 {% endblock %}

@@ -27,6 +27,7 @@ from .vpk_reader import open_vpk
 from .db import init_db, SessionLocal, Upload, AppSetting, ReplicationReservation
 from .docker_manager import DockerManager
 from .aggregation import client_ip_is_allowed, token_is_valid
+from .chunked_upload import ChunkUploadError, ChunkUploadStore
 from .lan_replication import (
     PROTOCOL_VERSION,
     ReplicationArtifact,
@@ -57,6 +58,12 @@ DEFAULT_MAX_ARCHIVE_VPK_COUNT = int(os.getenv("MAX_ARCHIVE_VPK_COUNT", "50"))
 ARCHIVE_VPK_COUNT_SETTING_KEY = "archive_vpk_count"
 ARCHIVE_LIST_TIMEOUT_SECONDS = int(os.getenv("ARCHIVE_LIST_TIMEOUT_SECONDS", "120"))
 ARCHIVE_EXTRACT_TIMEOUT_SECONDS = int(os.getenv("ARCHIVE_EXTRACT_TIMEOUT_SECONDS", "600"))
+CHUNK_UPLOAD_SIZE_MB = max(1, min(32, int(os.getenv("CHUNK_UPLOAD_SIZE_MB", "8"))))
+CHUNK_UPLOAD_PARALLELISM = max(1, min(8, int(os.getenv("CHUNK_UPLOAD_PARALLELISM", "4"))))
+CHUNK_UPLOAD_MAX_AGE_HOURS = max(1, int(os.getenv("CHUNK_UPLOAD_MAX_AGE_HOURS", "48")))
+CHUNK_UPLOAD_DISK_RESERVE_MB = max(0, int(os.getenv("CHUNK_UPLOAD_DISK_RESERVE_MB", "512")))
+CHUNK_UPLOAD_MAX_ACTIVE_SESSIONS = max(1, int(os.getenv("CHUNK_UPLOAD_MAX_ACTIVE_SESSIONS", "64")))
+CHUNK_UPLOAD_MAX_SESSIONS_PER_CLIENT = max(1, int(os.getenv("CHUNK_UPLOAD_MAX_SESSIONS_PER_CLIENT", "4")))
 
 # 清理策略（分钟/小时）
 TMP_MAX_AGE_MIN = int(os.getenv("TMP_MAX_AGE_MIN", "30"))
@@ -67,6 +74,7 @@ SFTP_SCAN_INTERVAL_SECONDS = max(5, int(os.getenv("SFTP_SCAN_INTERVAL_SECONDS", 
 BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.getenv("DATA_DIR", os.path.join(os.path.dirname(BASE_DIR), "data"))
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
+CHUNK_UPLOAD_DIR = os.path.join(DATA_DIR, "upload_sessions")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 # 重要：上传文件与工作目录在系统 /tmp
@@ -75,6 +83,11 @@ TMP_DIR = os.getenv("TMP_DIR", "/tmp")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(TMP_DIR, exist_ok=True)
 CAPACITY_LOCK_PATH = os.path.join(DATA_DIR, ".capacity.lock")
+CHUNK_UPLOAD_STORE = ChunkUploadStore(
+    CHUNK_UPLOAD_DIR,
+    chunk_size=CHUNK_UPLOAD_SIZE_MB * 1024 * 1024,
+    max_age_seconds=CHUNK_UPLOAD_MAX_AGE_HOURS * 60 * 60,
+)
 
 app = FastAPI(title="VPK Uploader")
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
@@ -268,16 +281,17 @@ def active_replication_reserved_bytes(db) -> int:
 def replication_storage_snapshot(db) -> dict[str, Any]:
     used_bytes = active_upload_usage_bytes(db)
     reserved_bytes = active_replication_reserved_bytes(db)
+    chunk_reserved_bytes = CHUNK_UPLOAD_STORE.reserved_bytes()
     limit_mb = get_total_upload_limit_mb(db)
     limit_bytes = limit_mb * 1024 * 1024
     disk_free_bytes = shutil.disk_usage(UPLOAD_DIR).free
     disk_available_bytes = max(
         0,
-        disk_free_bytes - LAN_REPLICATION.disk_reserve_bytes - reserved_bytes,
+        disk_free_bytes - LAN_REPLICATION.disk_reserve_bytes - reserved_bytes - chunk_reserved_bytes,
     )
     quota_available_bytes = None
     if limit_bytes > 0:
-        quota_available_bytes = max(0, limit_bytes - used_bytes - reserved_bytes)
+        quota_available_bytes = max(0, limit_bytes - used_bytes - reserved_bytes - chunk_reserved_bytes)
     available_bytes = disk_available_bytes
     if quota_available_bytes is not None:
         available_bytes = min(available_bytes, quota_available_bytes)
@@ -285,6 +299,7 @@ def replication_storage_snapshot(db) -> dict[str, Any]:
         "limit_bytes": limit_bytes,
         "used_bytes": used_bytes,
         "reserved_bytes": reserved_bytes,
+        "chunk_reserved_bytes": chunk_reserved_bytes,
         "quota_available_bytes": quota_available_bytes,
         "disk_free_bytes": disk_free_bytes,
         "disk_reserve_bytes": LAN_REPLICATION.disk_reserve_bytes,
@@ -296,6 +311,8 @@ def storage_context(db) -> dict:
     snapshot = replication_storage_snapshot(db)
     used_bytes = int(snapshot["used_bytes"])
     reserved_bytes = int(snapshot["reserved_bytes"])
+    chunk_reserved_bytes = int(snapshot["chunk_reserved_bytes"])
+    all_reserved_bytes = reserved_bytes + chunk_reserved_bytes
     limit_mb = get_total_upload_limit_mb(db)
     limit_bytes = limit_mb * 1024 * 1024
     usage_percent = 0
@@ -303,18 +320,21 @@ def storage_context(db) -> dict:
 
     if limit_bytes > 0:
         usage_percent = min(100, round(used_bytes / limit_bytes * 100, 1))
-        remaining_bytes = max(0, limit_bytes - used_bytes)
+        remaining_bytes = max(0, limit_bytes - used_bytes - all_reserved_bytes)
 
     usage_label = f"已用 {_format_mb(used_bytes)} / {total_upload_limit_label(limit_mb)}"
     if remaining_bytes is not None:
         usage_label = f"{usage_label}，剩余 {_format_mb(remaining_bytes)}"
+    if all_reserved_bytes:
+        usage_label = f"{usage_label}，预留 {_format_mb(all_reserved_bytes)}"
 
     return {
         "total_upload_limit_mb": limit_mb,
         "total_upload_limit_label": total_upload_limit_label(limit_mb),
         "total_upload_limit_bytes": limit_bytes,
         "total_upload_used_bytes": used_bytes,
-        "total_upload_reserved_bytes": reserved_bytes,
+        "total_upload_reserved_bytes": all_reserved_bytes,
+        "chunk_upload_reserved_bytes": chunk_reserved_bytes,
         "total_upload_available_bytes": int(snapshot["available_bytes"]),
         "total_upload_used_label": _format_mb(used_bytes),
         "total_upload_usage_label": usage_label,
@@ -455,7 +475,11 @@ def upload_batch_response(request: Request, role: str, results: dict):
     return templates.TemplateResponse("index.html", index_context(request, batch_results=results))
 
 
-def total_capacity_error(db, new_file_size: int) -> Optional[str]:
+def total_capacity_error(
+    db,
+    new_file_size: int,
+    current_chunk_reservation: int = 0,
+) -> Optional[str]:
     limit_mb = get_total_upload_limit_mb(db)
     if limit_mb <= 0:
         return None
@@ -463,15 +487,17 @@ def total_capacity_error(db, new_file_size: int) -> Optional[str]:
     limit_bytes = limit_mb * 1024 * 1024
     used_bytes = active_upload_usage_bytes(db)
     reserved_bytes = active_replication_reserved_bytes(db)
-    if used_bytes + reserved_bytes + new_file_size <= limit_bytes:
+    chunk_reserved_bytes = max(0, CHUNK_UPLOAD_STORE.reserved_bytes() - current_chunk_reservation)
+    if used_bytes + reserved_bytes + chunk_reserved_bytes + new_file_size <= limit_bytes:
         return None
 
-    remaining_bytes = max(0, limit_bytes - used_bytes - reserved_bytes)
+    remaining_bytes = max(0, limit_bytes - used_bytes - reserved_bytes - chunk_reserved_bytes)
     reserved_detail = f"，复制预留 {_format_mb(reserved_bytes)}" if reserved_bytes else ""
+    chunk_detail = f"，分片上传预留 {_format_mb(chunk_reserved_bytes)}" if chunk_reserved_bytes else ""
     return (
         "上传失败：已超过上传总容量限制。"
         f"总容量上限 {total_upload_limit_label(limit_mb)}，"
-        f"当前已用 {_format_mb(used_bytes)}{reserved_detail}，"
+        f"当前已用 {_format_mb(used_bytes)}{reserved_detail}{chunk_detail}，"
         f"剩余 {_format_mb(remaining_bytes)}，"
         f"本次生成文件 {_format_mb(new_file_size)}。"
     )
@@ -730,6 +756,7 @@ def _process_vpk_upload(
     upload_sha256: str,
     upload_source: dict,
     upload_max_mb: int,
+    current_chunk_reservation: int = 0,
 ):
     display_name = _ensure_vpk_filename(source_vpk_name)
     work_base = _safe_base_no_ext(display_name)
@@ -777,7 +804,11 @@ def _process_vpk_upload(
                 result["deduplicated"] = True
                 return existing, result
 
-            capacity_error = total_capacity_error(db, server_size)
+            capacity_error = total_capacity_error(
+                db,
+                server_size,
+                current_chunk_reservation=current_chunk_reservation,
+            )
             if capacity_error:
                 _remove_file_quietly(server_path)
                 return None, {"name": display_name, "error": capacity_error}
@@ -1026,6 +1057,11 @@ def cleanup_tmp_and_work():
     except Exception:
         pass
 
+    try:
+        CHUNK_UPLOAD_STORE.cleanup_expired()
+    except Exception:
+        pass
+
     # 接收内网复制时先写隐藏分片；进程被强制终止后由这里清理孤立文件。
     try:
         max_partial_age = max(WORK_MAX_AGE_MIN * 60, LAN_REPLICATION.reservation_ttl_seconds)
@@ -1080,44 +1116,21 @@ async def index(request: Request):
     return templates.TemplateResponse("index.html", index_context(request))
 
 
-async def _handle_upload(
+def _process_staged_upload(
+    *,
     request: Request,
-    file: UploadFile,
+    tmp_upload_path: str,
+    original_name: str,
+    upload_ext: str,
+    read_bytes: int,
+    upload_sha256: str,
     role: str,
     ttl_hours: Optional[int],
-    render_error: bool = True,
+    upload_max_mb: int,
+    archive_vpk_count: int,
+    current_chunk_reservation: int,
 ):
-    # 1) 文件名校验：允许直接上传 VPK，或上传包含多个 VPK 的压缩包。
-    original_name, upload_ext = _split_supported_upload(file.filename)
-
-    # 2) 上传流写入系统 /tmp
-    db = SessionLocal()
-    try:
-        upload_max_mb = get_upload_max_mb(db)
-        archive_vpk_count = get_archive_vpk_count(db)
-    finally:
-        db.close()
-
     max_bytes = upload_max_mb * 1024 * 1024
-    tmp_upload_path = os.path.join(TMP_DIR, f"{secrets.token_hex(6)}{upload_ext}")
-
-    read_bytes = 0
-    sha256 = hashlib.sha256()
-
-    with open(tmp_upload_path, "wb") as out:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            read_bytes += len(chunk)
-            if read_bytes > max_bytes:
-                out.close()
-                _remove_file_quietly(tmp_upload_path)
-                raise HTTPException(status_code=400, detail=f"文件过大，超过 {upload_max_mb} MB 限制")
-            sha256.update(chunk)
-            out.write(chunk)
-
-    upload_sha256 = sha256.hexdigest()
     uploaded = []
     failed = []
     uploads = []
@@ -1149,6 +1162,7 @@ async def _handle_upload(
                         upload_sha256=upload_sha256,
                         upload_source=upload_source,
                         upload_max_mb=upload_max_mb,
+                        current_chunk_reservation=current_chunk_reservation,
                     )
                     tmp_vpk_path = None
                     if up is not None:
@@ -1178,6 +1192,7 @@ async def _handle_upload(
                 upload_sha256=upload_sha256,
                 upload_source=upload_source,
                 upload_max_mb=upload_max_mb,
+                current_chunk_reservation=current_chunk_reservation,
             )
             tmp_upload_path = None
             if up is not None:
@@ -1188,11 +1203,66 @@ async def _handle_upload(
     finally:
         _remove_file_quietly(tmp_upload_path)
 
-    results = {"uploaded": uploaded, "failed": failed}
+    return uploads, {"uploaded": uploaded, "failed": failed}
 
-    if uploaded:
+
+async def _handle_upload(
+    request: Request,
+    file: UploadFile,
+    role: str,
+    ttl_hours: Optional[int],
+    render_error: bool = True,
+    current_chunk_reservation: int = 0,
+):
+    # 1) 文件名校验：允许直接上传 VPK，或上传包含多个 VPK 的压缩包。
+    original_name, upload_ext = _split_supported_upload(file.filename)
+
+    # 2) 上传流写入系统 /tmp
+    db = SessionLocal()
+    try:
+        upload_max_mb = get_upload_max_mb(db)
+        archive_vpk_count = get_archive_vpk_count(db)
+    finally:
+        db.close()
+
+    max_bytes = upload_max_mb * 1024 * 1024
+    tmp_upload_path = os.path.join(TMP_DIR, f"{secrets.token_hex(6)}{upload_ext}")
+
+    read_bytes = 0
+    sha256 = hashlib.sha256()
+
+    with open(tmp_upload_path, "wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            read_bytes += len(chunk)
+            if read_bytes > max_bytes:
+                out.close()
+                _remove_file_quietly(tmp_upload_path)
+                raise HTTPException(status_code=400, detail=f"文件过大，超过 {upload_max_mb} MB 限制")
+            sha256.update(chunk)
+            out.write(chunk)
+
+    uploads, results = await asyncio.to_thread(
+        _process_staged_upload,
+        request=request,
+        tmp_upload_path=tmp_upload_path,
+        original_name=original_name,
+        upload_ext=upload_ext,
+        read_bytes=read_bytes,
+        upload_sha256=sha256.hexdigest(),
+        role=role,
+        ttl_hours=ttl_hours,
+        upload_max_mb=upload_max_mb,
+        archive_vpk_count=archive_vpk_count,
+        current_chunk_reservation=current_chunk_reservation,
+    )
+
+    if results["uploaded"]:
         return uploads, results, None
 
+    failed = results["failed"]
     first_failure = failed[0] if failed else {"error": "没有成功处理任何 VPK"}
     report = first_failure.get("report")
     response = upload_error_response(request, role, first_failure["error"], report=report) if render_error else None
@@ -1214,6 +1284,284 @@ def require_admin(request: Request):
     if sess.get("role") == "admin":
         return True
     raise HTTPException(status_code=401, detail="需要管理员登录")
+
+
+def _chunk_upload_http_error(exc: ChunkUploadError):
+    raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+async def _authorized_chunk_upload(request: Request, upload_id: str):
+    token = request.headers.get("X-Upload-Token", "")
+    try:
+        status = await asyncio.to_thread(CHUNK_UPLOAD_STORE.status, upload_id, token)
+    except ChunkUploadError as exc:
+        _chunk_upload_http_error(exc)
+    if status["role"] == "admin":
+        require_admin(request)
+    status["parallelism"] = CHUNK_UPLOAD_PARALLELISM
+    return token, status
+
+
+def _create_chunk_upload_session(
+    *,
+    filename: str,
+    size: int,
+    role: str,
+    ttl_hours: Optional[int],
+    owner_key: str,
+):
+    with capacity_guard():
+        db = SessionLocal()
+        try:
+            max_bytes = get_upload_max_mb(db) * 1024 * 1024
+            limit_mb = get_total_upload_limit_mb(db)
+            used_bytes = active_upload_usage_bytes(db)
+            replication_reserved = active_replication_reserved_bytes(db)
+        finally:
+            db.close()
+
+        chunk_reserved = CHUNK_UPLOAD_STORE.reserved_bytes()
+        total_sessions, owned_sessions = CHUNK_UPLOAD_STORE.active_session_counts(owner_key)
+        if total_sessions >= CHUNK_UPLOAD_MAX_ACTIVE_SESSIONS:
+            raise ChunkUploadError(429, "当前进行中的上传会话过多，请稍后再试")
+        if owned_sessions >= CHUNK_UPLOAD_MAX_SESSIONS_PER_CLIENT:
+            raise ChunkUploadError(429, "当前来源进行中的上传会话过多，请先完成或取消已有上传")
+        if limit_mb > 0:
+            limit_bytes = limit_mb * 1024 * 1024
+            if used_bytes + replication_reserved + chunk_reserved + size > limit_bytes:
+                raise ChunkUploadError(400, "上传失败：已超过上传总容量限制")
+
+        disk_free = shutil.disk_usage(CHUNK_UPLOAD_DIR).free
+        disk_reserve = max(
+            CHUNK_UPLOAD_DISK_RESERVE_MB * 1024 * 1024,
+            LAN_REPLICATION.disk_reserve_bytes,
+        )
+        if disk_free - disk_reserve - chunk_reserved - replication_reserved < size:
+            raise ChunkUploadError(507, "服务器磁盘空间不足，无法建立上传会话")
+
+        return CHUNK_UPLOAD_STORE.create(
+            filename=filename,
+            size=size,
+            role=role,
+            ttl_hours=ttl_hours,
+            max_bytes=max_bytes,
+            owner_key=owner_key,
+        )
+
+
+def _chunk_completion_space_error(current_size: int, assembled_ready: bool) -> Optional[str]:
+    with capacity_guard():
+        db = SessionLocal()
+        try:
+            replication_reserved = active_replication_reserved_bytes(db)
+        finally:
+            db.close()
+        other_chunk_reserved = max(0, CHUNK_UPLOAD_STORE.reserved_bytes() - current_size)
+        disk_reserve = max(
+            CHUNK_UPLOAD_DISK_RESERVE_MB * 1024 * 1024,
+            LAN_REPLICATION.disk_reserve_bytes,
+        )
+        data_free = shutil.disk_usage(CHUNK_UPLOAD_DIR).free
+        shared_reservations = disk_reserve + replication_reserved + other_chunk_reserved
+        same_device = os.stat(CHUNK_UPLOAD_DIR).st_dev == os.stat(TMP_DIR).st_dev
+        if same_device:
+            required_data_bytes = current_size + (0 if assembled_ready else current_size)
+        else:
+            required_data_bytes = 0 if assembled_ready else current_size
+        if data_free - shared_reservations < required_data_bytes:
+            return "服务器磁盘空间不足，无法合并并处理上传文件"
+        if not same_device and shutil.disk_usage(TMP_DIR).free - disk_reserve < current_size:
+            return "服务器临时空间不足，无法处理上传文件"
+        return None
+
+
+@app.post("/api/chunked-uploads", status_code=201)
+async def create_chunk_upload(request: Request):
+    try:
+        request_body = bytearray()
+        async for block in request.stream():
+            request_body.extend(block)
+            if len(request_body) > 16 * 1024:
+                raise HTTPException(status_code=413, detail="请求体过大")
+        payload = json.loads(request_body)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+
+    original_name, _ = _split_supported_upload(str(payload.get("filename", "")))
+    if len(original_name.encode("utf-8")) > 240:
+        raise HTTPException(status_code=400, detail="文件名过长")
+    try:
+        size = int(payload.get("size", 0))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="文件大小非法") from exc
+
+    role = str(payload.get("role", "guest"))
+    ttl_hours = None
+    if role == "admin":
+        require_admin(request)
+        try:
+            ttl_hours = int(payload.get("ttl_hours", 0))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="有效期非法") from exc
+        if ttl_hours < 0:
+            raise HTTPException(status_code=400, detail="有效期不能小于 0 小时")
+    elif role != "guest":
+        raise HTTPException(status_code=400, detail="上传角色非法")
+
+    try:
+        status = await asyncio.to_thread(
+            _create_chunk_upload_session,
+            filename=original_name,
+            size=size,
+            role=role,
+            ttl_hours=ttl_hours,
+            owner_key=request.client.host if request.client else "unknown",
+        )
+    except ChunkUploadError as exc:
+        _chunk_upload_http_error(exc)
+    status["parallelism"] = CHUNK_UPLOAD_PARALLELISM
+    status["expires_after_hours"] = CHUNK_UPLOAD_MAX_AGE_HOURS
+    return status
+
+
+@app.get("/api/chunked-uploads/{upload_id}")
+async def chunk_upload_status(request: Request, upload_id: str):
+    _, status = await _authorized_chunk_upload(request, upload_id)
+    return status
+
+
+@app.put("/api/chunked-uploads/{upload_id}/chunks/{chunk_index}")
+async def upload_chunk(request: Request, upload_id: str, chunk_index: int):
+    token, status = await _authorized_chunk_upload(request, upload_id)
+    if status["status"] not in {"uploading", "failed"}:
+        raise HTTPException(status_code=409, detail="当前上传会话不能接收分片")
+    if chunk_index < 0 or chunk_index >= status["total_chunks"]:
+        raise HTTPException(status_code=404, detail="分片序号超出范围")
+    if chunk_index == status["total_chunks"] - 1:
+        expected_size = status["size"] - chunk_index * status["chunk_size"]
+    else:
+        expected_size = status["chunk_size"]
+
+    blocks = []
+    received = 0
+    async for block in request.stream():
+        if not block:
+            continue
+        received += len(block)
+        if received > expected_size:
+            raise HTTPException(status_code=400, detail="分片大小超过预期")
+        blocks.append(block)
+    try:
+        return await asyncio.to_thread(
+            CHUNK_UPLOAD_STORE.write_chunk,
+            upload_id,
+            token,
+            chunk_index,
+            iter(blocks),
+        )
+    except ChunkUploadError as exc:
+        _chunk_upload_http_error(exc)
+
+
+@app.post("/api/chunked-uploads/{upload_id}/complete")
+async def complete_chunk_upload(request: Request, upload_id: str):
+    token, status = await _authorized_chunk_upload(request, upload_id)
+    if status["status"] == "completed":
+        return status["result"]
+    if status["status"] == "processing":
+        return JSONResponse(status_code=202, content={"ok": True, "status": "processing"})
+
+    owns_processing = False
+    processing_finished = False
+    try:
+        space_error = await asyncio.to_thread(
+            _chunk_completion_space_error,
+            status["size"],
+            bool(status.get("assembled")),
+        )
+        if space_error:
+            raise HTTPException(status_code=507, detail=space_error)
+
+        processing = await asyncio.to_thread(CHUNK_UPLOAD_STORE.begin_processing, upload_id, token)
+        if processing["status"] == "completed":
+            return processing["result"]
+        owns_processing = True
+        assembled_path, _ = await asyncio.to_thread(CHUNK_UPLOAD_STORE.assemble, upload_id, token)
+        with open(assembled_path, "rb") as source:
+            upload_file = UploadFile(filename=status["filename"], file=source)
+            uploads, results, _ = await _handle_upload(
+                request,
+                upload_file,
+                role=status["role"],
+                ttl_hours=status.get("ttl_hours"),
+                render_error=False,
+                current_chunk_reservation=status["size"],
+            )
+        if not uploads:
+            failed = results.get("failed", [])
+            detail = failed[0].get("error", "没有成功处理任何 VPK") if failed else "没有成功处理任何 VPK"
+            await asyncio.to_thread(CHUNK_UPLOAD_STORE.mark_failed, upload_id, token, detail)
+            raise HTTPException(status_code=400, detail=detail)
+
+        redirect_url = None
+        if status["role"] == "admin" and not results["failed"]:
+            redirect_url = "/admin"
+        elif len(uploads) == 1 and not results["failed"]:
+            redirect_url = f"/detail/{uploads[0].id}"
+        result = {
+            "ok": True,
+            "status": "completed",
+            "uploaded": results["uploaded"],
+            "failed": results["failed"],
+            "redirect_url": redirect_url,
+        }
+        await asyncio.to_thread(CHUNK_UPLOAD_STORE.mark_completed, upload_id, token, result)
+        processing_finished = True
+        return result
+    except asyncio.CancelledError:
+        if owns_processing and not processing_finished:
+            try:
+                await asyncio.shield(asyncio.to_thread(
+                    CHUNK_UPLOAD_STORE.mark_failed,
+                    upload_id,
+                    token,
+                    "服务器处理被中断，可以重新完成上传",
+                ))
+            except ChunkUploadError:
+                pass
+        raise
+    except HTTPException as exc:
+        try:
+            detail = exc.detail if isinstance(exc.detail, str) else "服务器处理失败"
+            await asyncio.to_thread(CHUNK_UPLOAD_STORE.mark_failed, upload_id, token, detail)
+        except ChunkUploadError:
+            pass
+        raise
+    except ChunkUploadError as exc:
+        if exc.status_code == 409 and "正在处理" in exc.detail:
+            return JSONResponse(status_code=202, content={"ok": True, "status": "processing"})
+        _chunk_upload_http_error(exc)
+    except Exception as exc:
+        logger.exception("chunked upload completion failed upload_id=%s", upload_id)
+        try:
+            await asyncio.to_thread(CHUNK_UPLOAD_STORE.mark_failed, upload_id, token, "服务器处理失败")
+        except ChunkUploadError:
+            pass
+        raise HTTPException(status_code=500, detail="服务器处理失败") from exc
+
+
+@app.delete("/api/chunked-uploads/{upload_id}")
+async def cancel_chunk_upload(request: Request, upload_id: str):
+    token, _ = await _authorized_chunk_upload(request, upload_id)
+    try:
+        await asyncio.to_thread(CHUNK_UPLOAD_STORE.delete, upload_id, token)
+    except ChunkUploadError as exc:
+        _chunk_upload_http_error(exc)
+    return {"ok": True, "status": "cancelled"}
 
 
 def require_federation_token(request: Request) -> None:

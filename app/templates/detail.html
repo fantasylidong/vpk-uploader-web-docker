@@ -1,31 +1,41 @@
 {% extends "base.html" %}
+{% block title %}{{ item.original_name }} · VPK Uploader{% endblock %}
+{% block body_class %}page-detail{% endblock %}
 {% block content %}
-<section class="card">
-  <h2>文件详情 #{{ item.id }}</h2>
-  <p><strong>原始文件名：</strong>{{ item.original_name }}</p>
-  <p><strong>大小：</strong>{{ ('%.2f' % (item.size/1024/1024)) }} MB</p>
-  <p><strong>SHA256：</strong>{{ item.sha256 }}</p>
-  <p><strong>状态：</strong>{{ item.status }} {% if item.expires_at %}（到期：{{ item.expires_at }}）{% else %}（永久）{% endif %}</p>
-  <p>
-    <a class="btn" href="/d/{{ item.id }}">下载（服务器版）</a>
-  </p>
-  <details open>
+<article class="record-shell">
+  <header class="record-header">
+    <div>
+      <p class="record-id">UPLOAD #{{ item.id }}</p>
+      <h1>{{ item.original_name }}</h1>
+    </div>
+    <div class="record-actions">
+      <span class="status-tag">{{ item.status }}</span>
+      <a class="btn" href="/d/{{ item.id }}">下载服务器版</a>
+    </div>
+  </header>
+  <dl class="record-meta">
+    <div><dt>文件大小</dt><dd>{{ ('%.2f' % (item.size/1024/1024)) }} MB</dd></div>
+    <div><dt>保存期限</dt><dd>{% if item.expires_at %}{{ item.expires_at }}{% else %}永久{% endif %}</dd></div>
+    <div class="record-meta__wide"><dt>SHA256</dt><dd><code>{{ item.sha256 }}</code></dd></div>
+  </dl>
+  <details open class="inspection">
     <summary>VPK 校验报告</summary>
-    <pre>{{ report.validation | tojson }}</pre>
+    <pre tabindex="0">{{ report.validation | tojson }}</pre>
   </details>
   {% if report.server_build %}
-  <details open>
+  <details open class="inspection">
     <summary>服务器版构建报告</summary>
-    <pre>{{ report.server_build | tojson }}</pre>
+    <pre tabindex="0">{{ report.server_build | tojson }}</pre>
   </details>
   {% endif %}
-  <details open class="vpk-files" data-files-url="/api/uploads/{{ item.id }}/files">
+  <details open class="inspection vpk-files" data-files-url="/api/uploads/{{ item.id }}/files">
     <summary>VPK 文件列表</summary>
     <div class="file-list-controls">
-      <input type="search" class="file-list-search" placeholder="搜索文件路径">
-      <span class="muted file-list-status">正在加载...</span>
+      <label class="visually-hidden" for="vpk-file-search">搜索 VPK 文件路径</label>
+      <input id="vpk-file-search" type="search" class="file-list-search" placeholder="搜索文件路径">
+      <span class="muted file-list-status" role="status" aria-live="polite">正在加载...</span>
     </div>
-    <ul class="file-list"></ul>
+    <ul class="file-list" tabindex="0"></ul>
   </details>
-</section>
+</article>
 {% endblock %}

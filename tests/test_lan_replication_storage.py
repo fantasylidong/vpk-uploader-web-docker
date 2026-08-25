@@ -5,8 +5,10 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -19,6 +21,7 @@ os.environ["LAN_GROUP"] = "room-1"
 os.environ["LAN_PEER_API_TOKEN"] = "b" * 64
 os.environ["LAN_PEER_ALLOWED_CIDRS"] = "10.20.0.0/24"
 os.environ["LAN_DISK_RESERVE_MB"] = "0"
+os.environ["CHUNK_UPLOAD_DISK_RESERVE_MB"] = "0"
 
 from starlette.datastructures import UploadFile  # noqa: E402
 
@@ -59,6 +62,12 @@ class LanReplicationStorageTest(unittest.TestCase):
             path = os.path.join(main.UPLOAD_DIR, name)
             if os.path.isfile(path):
                 os.remove(path)
+        shutil.rmtree(main.CHUNK_UPLOAD_DIR, ignore_errors=True)
+        main.CHUNK_UPLOAD_STORE = main.ChunkUploadStore(
+            main.CHUNK_UPLOAD_DIR,
+            chunk_size=main.CHUNK_UPLOAD_SIZE_MB * 1024 * 1024,
+            max_age_seconds=main.CHUNK_UPLOAD_MAX_AGE_HOURS * 60 * 60,
+        )
         main.set_total_upload_limit_mb(0)
 
     def _payload(self, data: bytes, sha256: str | None = None):
@@ -245,6 +254,288 @@ class LanReplicationStorageTest(unittest.TestCase):
             self.assertEqual(report["upload_source"]["source_node_id"], "node-a")
         finally:
             db.close()
+
+    def test_chunked_upload_resumes_out_of_order_and_completes_once(self):
+        chunk_size = main.CHUNK_UPLOAD_STORE.chunk_size
+        first_chunk = b"a" * chunk_size
+        last_chunk = b"end"
+        total_size = len(first_chunk) + len(last_chunk)
+
+        async def exercise():
+            transport = httpx.ASGITransport(app=main.app, client=("127.0.0.1", 51000))
+            async with httpx.AsyncClient(transport=transport, base_url="http://uploader.test") as client:
+                created = await client.post("/api/chunked-uploads", json={
+                    "filename": "resume.vpk",
+                    "size": total_size,
+                    "role": "guest",
+                })
+                self.assertEqual(created.status_code, 201)
+                session = created.json()
+                headers = {"X-Upload-Token": session["token"]}
+
+                uploaded_last = await client.put(
+                    f"/api/chunked-uploads/{session['upload_id']}/chunks/1",
+                    headers=headers,
+                    content=last_chunk,
+                )
+                self.assertEqual(uploaded_last.status_code, 200)
+
+                missing = await client.post(
+                    f"/api/chunked-uploads/{session['upload_id']}/complete",
+                    headers=headers,
+                )
+                self.assertEqual(missing.status_code, 409)
+
+                resumed_store = main.ChunkUploadStore(
+                    main.CHUNK_UPLOAD_DIR,
+                    chunk_size=chunk_size,
+                    max_age_seconds=main.CHUNK_UPLOAD_MAX_AGE_HOURS * 60 * 60,
+                )
+                resumed = resumed_store.status(session["upload_id"], session["token"])
+                self.assertEqual(resumed["uploaded_chunks"], [1])
+
+                wrong_token = await client.get(
+                    f"/api/chunked-uploads/{session['upload_id']}",
+                    headers={"X-Upload-Token": "wrong"},
+                )
+                self.assertEqual(wrong_token.status_code, 401)
+
+                uploaded_first = await client.put(
+                    f"/api/chunked-uploads/{session['upload_id']}/chunks/0",
+                    headers=headers,
+                    content=first_chunk,
+                )
+                self.assertEqual(uploaded_first.status_code, 200)
+                status = await client.get(
+                    f"/api/chunked-uploads/{session['upload_id']}",
+                    headers=headers,
+                )
+                self.assertEqual(status.json()["uploaded_chunks"], [0, 1])
+
+                main.CHUNK_UPLOAD_STORE.begin_processing(session["upload_id"], session["token"])
+                concurrent = await client.post(
+                    f"/api/chunked-uploads/{session['upload_id']}/complete",
+                    headers=headers,
+                )
+                self.assertEqual(concurrent.status_code, 202)
+                self.assertEqual(concurrent.json()["status"], "processing")
+                main.CHUNK_UPLOAD_STORE.mark_failed(session["upload_id"], session["token"], "retry")
+
+                item_result = {
+                    "id": 91,
+                    "original_name": "resume.vpk",
+                    "stored_name": "resume_server.vpk",
+                    "sha256": "1" * 64,
+                    "size": 123,
+                    "size_label": "0.00 MB",
+                    "detail_url": "/detail/91",
+                    "download_url": "/d/91",
+                }
+                handler = AsyncMock(return_value=(
+                    [SimpleNamespace(id=91)],
+                    {"uploaded": [item_result], "failed": []},
+                    None,
+                ))
+                with patch.object(main, "_handle_upload", new=handler):
+                    completed = await client.post(
+                        f"/api/chunked-uploads/{session['upload_id']}/complete",
+                        headers=headers,
+                    )
+                    repeated = await client.post(
+                        f"/api/chunked-uploads/{session['upload_id']}/complete",
+                        headers=headers,
+                    )
+
+                self.assertEqual(completed.status_code, 200)
+                self.assertEqual(completed.json()["redirect_url"], "/detail/91")
+                self.assertEqual(repeated.json(), completed.json())
+                self.assertEqual(handler.await_count, 1)
+                final_status = await client.get(
+                    f"/api/chunked-uploads/{session['upload_id']}",
+                    headers=headers,
+                )
+                self.assertEqual(final_status.json()["status"], "completed")
+
+        asyncio.run(exercise())
+
+    def test_chunked_admin_session_requires_login_on_every_request(self):
+        async def exercise():
+            transport = httpx.ASGITransport(app=main.app, client=("127.0.0.1", 51000))
+            async with httpx.AsyncClient(transport=transport, base_url="http://uploader.test") as client:
+                denied = await client.post("/api/chunked-uploads", json={
+                    "filename": "admin.vpk",
+                    "size": 4,
+                    "role": "admin",
+                    "ttl_hours": 0,
+                })
+                self.assertEqual(denied.status_code, 401)
+
+                client.cookies.set("session", main.signer.dumps({"role": "admin"}))
+                created = await client.post("/api/chunked-uploads", json={
+                    "filename": "admin.vpk",
+                    "size": 4,
+                    "role": "admin",
+                    "ttl_hours": 0,
+                })
+                self.assertEqual(created.status_code, 201)
+                session = created.json()
+                headers = {"X-Upload-Token": session["token"]}
+
+                client.cookies.clear()
+                denied_chunk = await client.put(
+                    f"/api/chunked-uploads/{session['upload_id']}/chunks/0",
+                    headers=headers,
+                    content=b"vpk!",
+                )
+                self.assertEqual(denied_chunk.status_code, 401)
+
+                client.cookies.set("session", main.signer.dumps({"role": "admin"}))
+                accepted_chunk = await client.put(
+                    f"/api/chunked-uploads/{session['upload_id']}/chunks/0",
+                    headers=headers,
+                    content=b"vpk!",
+                )
+                self.assertEqual(accepted_chunk.status_code, 200)
+                cancelled = await client.delete(
+                    f"/api/chunked-uploads/{session['upload_id']}",
+                    headers=headers,
+                )
+                self.assertEqual(cancelled.status_code, 200)
+                missing = await client.get(
+                    f"/api/chunked-uploads/{session['upload_id']}",
+                    headers=headers,
+                )
+                self.assertEqual(missing.status_code, 404)
+
+        asyncio.run(exercise())
+
+    def test_chunked_upload_rejects_oversize_before_receiving_chunks(self):
+        main.set_upload_max_mb(1)
+
+        async def exercise():
+            transport = httpx.ASGITransport(app=main.app, client=("127.0.0.1", 51000))
+            async with httpx.AsyncClient(transport=transport, base_url="http://uploader.test") as client:
+                response = await client.post("/api/chunked-uploads", json={
+                    "filename": "large.vpk",
+                    "size": 1024 * 1024 + 1,
+                    "role": "guest",
+                })
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("文件过大", response.json()["detail"])
+
+        asyncio.run(exercise())
+
+    def test_chunked_upload_sessions_reserve_total_capacity(self):
+        main.set_total_upload_limit_mb(1)
+
+        async def exercise():
+            transport = httpx.ASGITransport(app=main.app, client=("127.0.0.1", 51000))
+            async with httpx.AsyncClient(transport=transport, base_url="http://uploader.test") as client:
+                first = await client.post("/api/chunked-uploads", json={
+                    "filename": "first.vpk",
+                    "size": 700 * 1024,
+                    "role": "guest",
+                })
+                second = await client.post("/api/chunked-uploads", json={
+                    "filename": "second.vpk",
+                    "size": 400 * 1024,
+                    "role": "guest",
+                })
+                self.assertEqual(first.status_code, 201)
+                self.assertEqual(second.status_code, 400)
+                self.assertIn("总容量", second.json()["detail"])
+
+                db = SessionLocal()
+                try:
+                    self.assertIsNotNone(main.total_capacity_error(db, 400 * 1024))
+                    snapshot = main.replication_storage_snapshot(db)
+                    self.assertEqual(snapshot["chunk_reserved_bytes"], 700 * 1024)
+                    self.assertEqual(snapshot["quota_available_bytes"], 324 * 1024)
+                finally:
+                    db.close()
+
+        asyncio.run(exercise())
+
+    def test_chunk_store_restart_uses_durable_assembled_file(self):
+        root = os.path.join(TEST_DATA_DIR, "restart-store")
+        store = main.ChunkUploadStore(root, chunk_size=4, max_age_seconds=3600)
+        session = store.create(
+            filename="restart.vpk",
+            size=7,
+            role="guest",
+            ttl_hours=None,
+            max_bytes=1024,
+            owner_key="test",
+        )
+        store.write_chunk(session["upload_id"], session["token"], 1, iter([b"end"]))
+        store.write_chunk(session["upload_id"], session["token"], 0, iter([b"data"]))
+        store.begin_processing(session["upload_id"], session["token"])
+        assembled_path, digest = store.assemble(session["upload_id"], session["token"])
+
+        restarted = main.ChunkUploadStore(root, chunk_size=4, max_age_seconds=3600)
+        status = restarted.status(session["upload_id"], session["token"])
+        self.assertEqual(status["status"], "failed")
+        self.assertTrue(status["assembled"])
+        self.assertEqual(status["uploaded_chunks"], [0, 1])
+        restarted.begin_processing(session["upload_id"], session["token"])
+        resumed_path, resumed_digest = restarted.assemble(session["upload_id"], session["token"])
+        self.assertEqual(resumed_path, assembled_path)
+        self.assertEqual(resumed_digest, digest)
+
+        result = {"ok": True, "status": "completed", "uploaded": [], "failed": [], "redirect_url": "/"}
+        with patch.object(restarted, "_remove_payload_unlocked", side_effect=OSError("simulated crash")):
+            restarted.mark_completed(session["upload_id"], session["token"], result)
+        after_crash = main.ChunkUploadStore(root, chunk_size=4, max_age_seconds=3600)
+        completed = after_crash.status(session["upload_id"], session["token"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["result"], result)
+
+    def test_chunk_delete_waits_for_inflight_commit(self):
+        root = os.path.join(TEST_DATA_DIR, "delete-race-store")
+        store = main.ChunkUploadStore(root, chunk_size=4, max_age_seconds=3600)
+        session = store.create(
+            filename="race.vpk",
+            size=4,
+            role="guest",
+            ttl_hours=None,
+            max_bytes=1024,
+            owner_key="test",
+        )
+        started = threading.Event()
+        delete_started = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def slow_body():
+            started.set()
+            release.wait(timeout=2)
+            yield b"vpk!"
+
+        def write_chunk():
+            try:
+                store.write_chunk(session["upload_id"], session["token"], 0, slow_body())
+            except Exception as exc:
+                errors.append(exc)
+
+        def delete_session():
+            try:
+                delete_started.set()
+                store.delete(session["upload_id"], session["token"])
+            except Exception as exc:
+                errors.append(exc)
+
+        writer = threading.Thread(target=write_chunk)
+        deleter = threading.Thread(target=delete_session)
+        writer.start()
+        self.assertTrue(started.wait(timeout=1))
+        deleter.start()
+        self.assertTrue(delete_started.wait(timeout=1))
+        self.assertTrue(deleter.is_alive())
+        release.set()
+        writer.join(timeout=2)
+        deleter.join(timeout=2)
+        self.assertEqual(errors, [])
+        self.assertFalse(os.path.exists(os.path.join(root, session["upload_id"])))
 
 
 if __name__ == "__main__":

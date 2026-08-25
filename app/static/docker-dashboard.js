@@ -25,13 +25,25 @@
     try {
       const data = await request('/api/admin/docker/containers');
       const running = data.containers.filter(item => item.status === 'running').length;
+      const active = document.activeElement;
+      const focusState = active && containers.contains(active) ? {
+        action: active.dataset.action || '',
+        id: active.dataset.id || '',
+        filesId: active.dataset.filesId || ''
+      } : null;
       summary.innerHTML = `<strong>${data.containers.length}</strong> 个容器 · <strong>${running}</strong> 个运行中 · ${esc(new Date(data.generated_at).toLocaleString())}`;
       containers.innerHTML = data.containers.map(item => `<article class="container-card">
-        <div class="container-title"><div><h3>${esc(item.name)}</h3><code>${esc(item.short_id)} · ${esc(item.image)}</code></div><span class="status status-${esc(item.status)}">${esc(item.status)}</span></div>
+        <div class="container-title"><div><h2>${esc(item.name)}</h2><code>${esc(item.short_id)} · ${esc(item.image)}</code></div><span class="status status-${esc(item.status)}">${esc(item.status)}</span></div>
         <div class="metric-grid"><div><span>CPU</span><strong>${item.cpu_percent.toFixed(1)}%</strong></div><div><span>内存</span><strong>${bytes(item.memory_usage)} / ${bytes(item.memory_limit)}</strong></div><div><span>网络 ↓ / ↑</span><strong>${bytes(item.network_rx)} / ${bytes(item.network_tx)}</strong></div><div><span>磁盘读 / 写</span><strong>${bytes(item.block_read)} / ${bytes(item.block_write)}</strong></div></div>
         <div class="mount-list"><span class="muted">挂载</span>${item.mounts.length ? item.mounts.map(m => `<code title="${esc(m.source)}">${esc(m.destination)} ${m.writable ? '读写' : '只读'}</code>`).join('') : '<code>无</code>'}</div>
         <div class="row container-actions"><button data-action="start" data-id="${esc(item.id)}" ${item.status === 'running' ? 'disabled' : ''}>启动</button><button class="secondary" data-action="restart" data-id="${esc(item.id)}" ${item.status !== 'running' ? 'disabled' : ''}>重启</button><button class="danger" data-action="stop" data-id="${esc(item.id)}" ${item.status !== 'running' ? 'disabled' : ''}>停止</button><button class="secondary" data-files-id="${esc(item.id)}" data-name="${esc(item.name)}" ${item.status !== 'running' ? 'disabled' : ''}>文件</button></div>
       </article>`).join('') || '<p class="muted">没有容器</p>';
+      if (focusState) {
+        const selector = focusState.filesId
+          ? `[data-files-id="${CSS.escape(focusState.filesId)}"]`
+          : `[data-action="${CSS.escape(focusState.action)}"][data-id="${CSS.escape(focusState.id)}"]`;
+        containers.querySelector(selector)?.focus({preventScroll: true});
+      }
     } catch (err) { error.textContent = err.message; error.hidden = false; containers.innerHTML = ''; }
   }
   async function action(id, action, button) {
@@ -42,10 +54,21 @@
   async function loadFiles(path) {
     currentPath = path;
     dialog.querySelector('[data-current-path]').textContent = path;
-    const data = await request(`/api/admin/docker/containers/${encodeURIComponent(fileContainer)}/files?path=${encodeURIComponent(path)}`);
-    dialog.querySelector('[data-parent]').disabled = !data.parent;
-    dialog.querySelector('[data-parent]').dataset.path = data.parent || '';
-    dialog.querySelector('[data-files]').innerHTML = data.entries.map(item => `<button type="button" class="file-entry" ${item.type === 'directory' ? `data-path="${esc(item.path)}"` : 'disabled'}><span>${item.type === 'directory' ? '目录' : '文件'} · ${esc(item.name)}</span><small>${item.type === 'file' ? bytes(item.size) : ''}</small></button>`).join('') || '<p class="muted">目录为空</p>';
+    const listing = dialog.querySelector('[data-files]');
+    listing.classList.remove('file-listing-error');
+    listing.innerHTML = '<p class="muted">正在读取目录...</p>';
+    try {
+      const data = await request(`/api/admin/docker/containers/${encodeURIComponent(fileContainer)}/files?path=${encodeURIComponent(path)}`);
+      dialog.querySelector('[data-parent]').disabled = !data.parent;
+      dialog.querySelector('[data-parent]').dataset.path = data.parent || '';
+      listing.innerHTML = data.entries.map(item => `<button type="button" class="file-entry" ${item.type === 'directory' ? `data-path="${esc(item.path)}"` : 'disabled'}><span>${item.type === 'directory' ? '目录' : '文件'} · ${esc(item.name)}</span><small>${item.type === 'file' ? bytes(item.size) : ''}</small></button>`).join('') || '<p class="muted">目录为空</p>';
+      const firstDirectory = listing.querySelector('[data-path]');
+      (firstDirectory || listing).focus({preventScroll: true});
+    } catch (err) {
+      listing.textContent = `读取目录失败：${err.message}`;
+      listing.classList.add('file-listing-error');
+      listing.focus({preventScroll: true});
+    }
   }
   root.addEventListener('click', event => { const actionButton = event.target.closest('[data-action]'); if (actionButton) action(actionButton.dataset.id, actionButton.dataset.action, actionButton); const fileButton = event.target.closest('[data-files-id]'); if (fileButton) { fileContainer = fileButton.dataset.filesId; dialog.querySelector('[data-file-title]').textContent = `${fileButton.dataset.name} 文件`; dialog.showModal(); loadFiles('/'); } });
   dialog.addEventListener('click', event => { const entry = event.target.closest('[data-path]'); if (entry) loadFiles(entry.dataset.path); });

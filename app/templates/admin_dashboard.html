@@ -1,92 +1,86 @@
 {% extends "base.html" %}
+{% block title %}文件管理 · VPK Uploader{% endblock %}
+{% block body_class %}page-admin{% endblock %}
 {% block content %}
-<section class="card">
-  <div class="page-heading">
-    <div><h2>管理员面板</h2><p class="muted">上传文件与容量设置</p></div>
-    <a class="btn secondary" href="/admin/docker">本机 Docker</a>
+<div class="page-heading page-heading--primary">
+  <div><h1>文件管理</h1><p>上传文件与容量设置</p></div>
+  <div class="heading-actions"><a class="link" href="/admin/logout">退出</a><a class="btn secondary" href="/admin/docker">本机 Docker</a></div>
+</div>
+
+<div class="admin-workspace">
+  <section class="workspace-section">
+    <div class="section-heading"><div><h2>运行限制</h2><p>单文件 {{ max_mb }} MB，压缩包 {{ archive_vpk_count }} 个 VPK，{{ guest_ttl_label }}，容量 {{ total_upload_usage_label }}</p></div></div>
+    <form action="/admin/settings" method="post" class="settings-form settings-grid">
+      <label class="field"><span class="field-label">单文件上限（MB）</span><input type="number" min="1" name="upload_max_mb" value="{{ max_mb }}" required></label>
+      <label class="field"><span class="field-label">压缩包 VPK 上限</span><input type="number" min="1" name="archive_vpk_count" value="{{ archive_vpk_count }}" required></label>
+      <label class="field"><span class="field-label">普通用户保存（小时）</span><input type="number" min="0" name="guest_ttl_hours" value="{{ guest_ttl_hours }}" required></label>
+      <label class="field"><span class="field-label">总容量（MB，0=不限）</span><input type="number" min="0" name="total_upload_limit_mb" value="{{ total_upload_limit_mb }}" required></label>
+      <button class="settings-submit" type="submit">保存设置</button>
+    </form>
+  </section>
+
+  {% if settings_saved or upload_message or upload_error %}
+  <div class="flash-stack">
+    {% if settings_saved %}<div class="success" role="status">设置已更新</div>{% endif %}
+    {% if upload_message %}<div class="success" role="status">{{ upload_message }}</div>{% endif %}
+    {% if upload_error %}<div class="error" role="alert">{{ upload_error }}</div>{% endif %}
   </div>
-  <form action="/admin/settings" method="post" class="row settings-form">
-    <label>单文件上传上限（MB）
-      <input type="number" min="1" name="upload_max_mb" value="{{ max_mb }}" required>
-    </label>
-    <label>压缩包内 VPK 数量上限
-      <input type="number" min="1" name="archive_vpk_count" value="{{ archive_vpk_count }}" required>
-    </label>
-    <label>普通用户保存时间（小时，0=永久）
-      <input type="number" min="0" name="guest_ttl_hours" value="{{ guest_ttl_hours }}" required>
-    </label>
-    <label>上传总容量（MB，0=不限）
-      <input type="number" min="0" name="total_upload_limit_mb" value="{{ total_upload_limit_mb }}" required>
-    </label>
-    <button type="submit">保存设置</button>
-    <span class="muted">单文件：{{ max_mb }} MB；压缩包 VPK：{{ archive_vpk_count }} 个；保存时间：{{ guest_ttl_label }}；容量：{{ total_upload_usage_label }}</span>
-  </form>
-  {% if settings_saved %}
-    <div class="success">设置已更新</div>
-  {% endif %}
-  {% if upload_message %}
-    <div class="success">{{ upload_message }}</div>
-  {% endif %}
-  {% if upload_error %}
-    <div class="error">{{ upload_error }}</div>
   {% endif %}
 
-  <form action="/admin/upload" method="post" enctype="multipart/form-data" class="row upload-form">
-    <div>
-      <input type="file" name="file" accept="{{ upload_accept }}" required>
-    </div>
-    <div>
-      <label>有效期（小时，0=永久） <input type="number" min="0" name="ttl_hours" value="0"></label>
-    </div>
-    <div>
-      <button type="submit">上传</button>
-    </div>
-    <div class="upload-progress" hidden>
-      <div class="upload-progress__meta">
-        <span class="upload-progress__label">准备上传...</span>
-        <span class="upload-progress__percent">0%</span>
+  <section class="workspace-section upload-panel">
+    <div class="section-heading"><div><h2>管理员上传</h2><p>有效期设为 0 时永久保留</p></div></div>
+    <form action="/admin/upload" method="post" enctype="multipart/form-data" class="upload-form admin-upload-form">
+      <label class="field"><span class="field-label">上传文件</span><input type="file" name="file" accept="{{ upload_accept }}" required></label>
+      <label class="field"><span class="field-label">有效期（小时）</span><input type="number" min="0" name="ttl_hours" value="0"></label>
+      <button type="submit">开始上传</button>
+      <div class="upload-progress" hidden>
+        <div class="upload-progress__meta"><span class="upload-progress__label" id="admin-upload-progress-label" aria-live="polite">准备上传...</span><span class="upload-progress__percent">0%</span></div>
+        <div class="upload-progress__track" role="progressbar" aria-labelledby="admin-upload-progress-label" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="upload-progress__bar"></div></div>
       </div>
-      <div class="upload-progress__track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-        <div class="upload-progress__bar"></div>
-      </div>
+    </form>
+  </section>
+
+  <section class="workspace-section records-section">
+    <div class="section-heading records-heading">
+      <div><h2>上传记录</h2><p>最多显示最近 200 条</p></div>
+      <form method="get" action="/admin" class="search-form">
+        <label class="visually-hidden" for="upload-search">按原始文件名搜索</label>
+        <input id="upload-search" name="q" value="{{ q }}" placeholder="按文件名搜索">
+        <button type="submit">搜索</button>
+      </form>
     </div>
-  </form>
-
-  <form method="get" action="/admin" class="row">
-    <input name="q" value="{{ q }}" placeholder="按原始文件名搜索">
-    <button type="submit">搜索</button>
-    <a class="link" href="/admin/logout">退出</a>
-  </form>
-
-  <table class="table">
-    <thead>
-      <tr>
-        <th>ID</th><th>文件名</th><th>大小(MB)</th><th>角色</th><th>创建时间</th><th>到期</th><th>状态</th><th>操作</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for it in items %}
-      <tr>
-        <td>{{ it.id }}</td>
-        <td><a href="/detail/{{ it.id }}">{{ it.original_name }}</a></td>
-        <td>{{ ('%.2f' % (it.size/1024/1024)) }}</td>
-        <td>{{ it.role }}</td>
-        <td>{{ it.created_at }}</td>
-        <td>{% if it.expires_at %}{{ it.expires_at }}{% else %}<span class="tag">永久</span>{% endif %}</td>
-        <td>{{ it.status }}</td>
-        <td class="row">
-          <a class="btn" href="/d/{{ it.id }}" target="_blank">下载</a>
-          <form action="/admin/set_expiry/{{ it.id }}" method="post">
-            <input type="number" name="hours" min="0" placeholder="小时">
-            <button>设定</button>
-          </form>
-          <form action="/admin/delete/{{ it.id }}" method="post" onsubmit="return confirm('确定删除?')">
-            <button class="danger">删除</button>
-          </form>
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-</section>
+    <div class="table-shell" tabindex="0" aria-label="上传记录表，可横向滚动">
+      <table class="table">
+        <thead><tr><th>ID</th><th>文件名</th><th>大小</th><th>角色</th><th>创建时间</th><th>到期</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody>
+          {% for it in items %}
+          <tr>
+            <td>{{ it.id }}</td>
+            <td class="file-name-cell"><a href="/detail/{{ it.id }}">{{ it.original_name }}</a></td>
+            <td>{{ ('%.2f' % (it.size/1024/1024)) }} MB</td>
+            <td><code>{{ it.role }}</code></td>
+            <td>{{ it.created_at }}</td>
+            <td>{% if it.expires_at %}{{ it.expires_at }}{% else %}<span class="tag">永久</span>{% endif %}</td>
+            <td><span class="status-tag">{{ it.status }}</span></td>
+            <td>
+              <div class="table-actions">
+                <a class="btn compact" href="/d/{{ it.id }}" target="_blank" rel="noopener">下载</a>
+                <form class="inline-form" action="/admin/set_expiry/{{ it.id }}" method="post">
+                  <input type="number" name="hours" min="0" placeholder="小时" aria-label="新的有效期，小时">
+                  <button class="secondary compact" type="submit">设定</button>
+                </form>
+                <form action="/admin/delete/{{ it.id }}" method="post" onsubmit="return confirm('确定删除?')">
+                  <button class="danger compact" type="submit">删除</button>
+                </form>
+              </div>
+            </td>
+          </tr>
+          {% else %}
+          <tr><td class="empty-state" colspan="8">没有匹配的上传记录</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
 {% endblock %}
