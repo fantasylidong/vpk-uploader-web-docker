@@ -43,5 +43,23 @@ class ReplicationReservation(Base):
     status = Column(String(32), nullable=False, default="active", index=True)
 
 
+class WorkshopJob(Base):
+    """创意工坊导入任务，供 NewAnneWeb 轮询进度。"""
+
+    __tablename__ = "workshop_jobs"
+    id = Column(String(64), primary_key=True, index=True)
+    status = Column(String(32), nullable=False, default="queued", index=True)
+    role = Column(String(32), nullable=False, default="admin")
+    ttl_hours = Column(Integer, nullable=True)
+    request = Column(Text, nullable=True)
+    items = Column(Text, nullable=False, default="[]")
+    replication = Column(Text, nullable=True)
+    error = Column(Text, nullable=True)
+    source_ip = Column(String(64), nullable=True)
+    created_at = Column(DateTime, nullable=False, index=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)

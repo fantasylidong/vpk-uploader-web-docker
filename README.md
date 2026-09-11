@@ -12,6 +12,7 @@
 - 管理员登录后可进入 `/admin/docker`，查看全部容器的状态、CPU、内存、网络、磁盘 I/O、挂载信息和容器文件目录，并执行启动、停止、重启。
 - 可由 NewAnneWeb 聚合多个上传节点的文件、容量、Docker 信息和 srcds 状态；本项目提供受 Token 保护的 federation API。
 - 聚合上传可以按内网组自动复制：公网文件只进入一个种子节点，种子节点生成服务器版 VPK 后通过内网同步到同组节点；容量不足的节点会跳过，不影响其他节点。
+- 内置 steamcmd，可由 NewAnneWeb 通过 `POST /api/federation/workshop` 触发从 Steam 创意工坊下载物品或合集，下载结果走同一条服务器版流水线入库并参与内网复制。
 
 ## 本地构建
 ```bash
@@ -101,6 +102,110 @@ LAN_PEER_TLS_VERIFY=1
 openssl rand -hex 32
 ```
 
+## Steam 创意工坊导入
+
+节点只负责下载和入库，面向用户的鉴权和界面由 NewAnneWeb 负责；接口和聚合管理一样受 `FEDERATION_API_TOKEN` + `FEDERATION_ALLOWED_CIDRS` 双重保护。
+
+下载可能持续几分钟，接口因此是异步的：`POST` 建任务立刻返回 `job_id`，再用 `GET` 轮询。
+
+```bash
+# 建任务：物品 ID、创意工坊链接、合集 ID 可以混着给，items 也接受一行一个的多行文本
+curl -X POST https://node.example.com/api/federation/workshop \
+  -H "Authorization: Bearer $FEDERATION_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"items": ["2547462987", "https://steamcommunity.com/sharedfiles/filedetails/?id=1234567890"],
+       "collections": ["900000001"],
+       "ttl_hours": 0}'
+```
+
+返回 `202` 和任务信息，其中 `status_url` 就是轮询地址：
+
+```json
+{
+  "ok": true,
+  "job_id": "c723f93352a14191a2b79f0a00529594",
+  "status": "queued",
+  "status_url": "https://node.example.com/api/federation/workshop/c723f9...",
+  "request": {"ids": ["2547462987", "1234567890"], "collections": ["900000001"]}
+}
+```
+
+`GET /api/federation/workshop/{job_id}` 返回逐个物品的状态；`GET /api/federation/workshop?limit=20` 列出最近的任务。任务状态为 `queued` / `running` / `succeeded` / `partial` / `failed`，单个物品状态为 `pending` / `downloading` / `processing` / `succeeded` / `partial` / `failed`：
+
+```json
+{
+  "job_id": "c723f93352a14191a2b79f0a00529594",
+  "status": "partial",
+  "item_total": 2,
+  "item_counts": {"succeeded": 1, "failed": 1},
+  "upload_count": 1,
+  "items": [
+    {"workshop_id": "2547462987", "state": "succeeded", "title": "某张图",
+     "origin": "item", "download_source": "direct",
+     "uploads": [{"id": 12, "original_name": "某张图_2547462987.vpk", "download_url": "/d/12"}]},
+    {"workshop_id": "1234567890", "state": "failed", "error": "steamcmd 下载失败：..."}
+  ],
+  "replication": {"peers": []}
+}
+```
+
+`ttl_hours` 省略或填 `0` 表示永久保留，和管理员上传一致。入库后的文件会出现在 `/api/thirdparty-maps`，并按内网组复制到同组节点。
+
+### 上游可以把直链一起带过来
+
+节点所在机房常常连不上 `api.steampowered.com`（实测三台生产节点里只有一台通），但 UGC CDN `cdn.steamusercontent.com` 三台都通。因此 `POST /api/federation/workshop` 接受一个可选的 `details` 映射：上游（NewAnneWeb）把自己查好的 Steam 元数据带过来，节点就不必访问 Web API，直接走直链下载。
+
+```json
+{
+  "items": ["3001153036"],
+  "details": {
+    "3001153036": {
+      "file_url": "https://cdn.steamusercontent.com/ugc/.../",
+      "filename": "whit.vpk",
+      "file_size": 5636096,
+      "title": "Whitaker's Weapons Range",
+      "consumer_app_id": 550
+    }
+  }
+}
+```
+
+`details` 是纯优化，省略时行为不变。节点对带来的每一项都要过校验，任何一项不合格就当没提供、回退去查 Web API：
+
+- `file_url` 必须是 **https**，且主机在 `DIRECT_DOWNLOAD_HOST_SUFFIXES` 白名单内，调用方塞不进任意主机；
+- `filename` 必须以 `.vpk` 结尾（否则不算真正的内容文件）；
+- `consumer_app_id` 给了就必须等于 `STEAM_WORKSHOP_APPID`。
+
+下载完照样核对 VPK 魔数，拿到非 VPK 一样退回 steamcmd。`site.workshop.accepts_supplied_details` 会告诉上游这个节点支持该字段。
+
+### 两条下载通道
+
+1. **直链**：`file_url` 来自上游带来的 `details`，或者节点自己查 Steam Web API。直接 HTTPS 取回，不需要 steamcmd，arm64 节点也能用。物品内容托管在 SteamPipe 上时 Steam 返回的 `file_url` 会退化成预览图地址，节点会识别出来并跳过这条通道。
+2. **steamcmd**：以匿名身份执行 `workshop_download_item`，覆盖直链拿不到的物品。**注意它依赖 `client-download.steampowered.com` 做自更新，实测三台生产节点全都解析不了这个域名，所以国内机房基本只能靠直链通道。**
+
+### steamcmd 的两个前提
+
+- **只有 amd64**。steamcmd 仅发布 32 位 x86 版本，`linux/arm64` 镜像照常构建但不含 steamcmd，此时只有直链通道可用，走 steamcmd 的物品会明确报错。
+- **需要能访问 `client-download.steampowered.com`**。steamcmd 每次启动都会自更新，这个域名解析不了就会静默退出。节点会把它自己的 `bootstrap_log.txt` 里的失败行拼进错误信息，例如 `steamcmd 退出码 1（Download failed: http error 0 (client-download.steampowered.com/client/steam_cmd_linux)）`，方便直接定位是网络问题。国内机器构建镜像时还可以用 `--build-arg STEAMCMD_URL=<镜像地址>` 换掉 steamcmd 安装包的下载源。
+
+首次调用会把镜像里的 steamcmd 复制到 `/app/data/steamcmd` 再运行，自更新和下载缓存都留在数据卷里，容器重建不用重下。任务串行执行（steamcmd 不支持并发使用同一个安装目录），未完成任务超过 `STEAM_WORKSHOP_MAX_QUEUED_JOBS` 时接口返回 `429`。节点重启会把队列里和执行中的任务标记为 `failed`，需要 NewAnneWeb 重新触发。
+
+### 相关环境变量
+
+```env
+STEAM_WORKSHOP_APPID=550
+STEAM_WORKSHOP_TIMEOUT_SECONDS=1800
+STEAM_WORKSHOP_RETRIES=3
+STEAM_WORKSHOP_MAX_QUEUED_JOBS=32
+STEAM_WORKSHOP_DIRECT_DOWNLOAD=1
+STEAM_WORKSHOP_ENFORCE_APPID=1
+STEAM_WORKSHOP_JOB_RETENTION_HOURS=72
+```
+
+`STEAM_WORKSHOP_ENFORCE_APPID=1` 时会拒绝 `consumer_app_id` 不是 `STEAM_WORKSHOP_APPID` 的物品，避免误导入别的游戏的内容。单次任务最多 200 个物品，合集最多向下展开 3 层。
+
+注意服务器版流水线只保留 `maps/**`、`scripts/vscripts/**`、`missions/**` 和 `addoninfo.txt`：导入纯素材类物品（语音包、模型皮肤）会得到一个几乎空的 VPK，这个功能针对的是地图包。
+
 ## 从 Docker Hub 运行
 ```bash
 docker run -d --name vpk-uploader -p 8080:8080   -e APP_SECRET="change-me" -e ADMIN_USER=admin -e ADMIN_PASS=admin123   -v /opt/vpk-uploader/data:/app/data   -v /var/run/docker.sock:/var/run/docker.sock   yourdockerhubname/vpk-uploader:latest
@@ -113,6 +218,7 @@ docker run -d --name vpk-uploader -p 8080:8080   -e APP_SECRET="change-me" -e AD
 - `/app/data/uploads`：最终服务器版 VPK；也可通过 SFTP 直接放入 `.vpk`，系统会按管理员上传自动登记
 - `/app/data/tmp`：上传临时文件（流程结束即删，附兜底清理）
 - `/app/data/upload_sessions`：断点续传会话与未完成分片（自动过期清理）
+- `/app/data/steamcmd`：steamcmd 安装目录、自更新内容和创意工坊下载缓存（物品处理完即删）
 
 `SFTP_IMPORT_MIN_AGE_SECONDS` 默认是 30 秒，避免登记仍在写入的文件；`SFTP_SCAN_INTERVAL_SECONDS` 默认是 60 秒，可调整后台补扫间隔，最小为 5 秒。
 
@@ -122,6 +228,8 @@ docker run -d --name vpk-uploader -p 8080:8080   -e APP_SECRET="change-me" -e AD
 接口地址：`/api/thirdparty-maps`。`PUBLIC_BASE_URL` 可留空，此时接口返回相对路径，由 NewAnneWeb 按节点地址访问。只有反向代理、NAT 外部端口等与实际监听地址不一致时才需要手动设置。
 
 聚合管理使用 Bearer Token 访问 `/api/federation/`。NewAnneWeb 可通过 `POST /api/federation/uploads` 以 multipart 字段 `file` 将 `.vpk`、`.zip`、`.rar` 或 `.7z` 文件上传到指定节点；该接口与 Docker 管理接口一样受 `FEDERATION_API_TOKEN` 和 `FEDERATION_ALLOWED_CIDRS` 双重限制。
+
+创意工坊导入走 `POST /api/federation/workshop`，用法见上文。`GET /api/federation/summary` 的 `site.workshop` 里带有本节点的创意工坊能力（`steamcmd_available`、`direct_download_enabled`、`active_jobs` 等），NewAnneWeb 可据此决定是否显示导入入口。
 
 返回示例：
 

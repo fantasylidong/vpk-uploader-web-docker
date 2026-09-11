@@ -4,7 +4,6 @@ import io
 import json
 import os
 import shutil
-import tempfile
 import threading
 import unittest
 from types import SimpleNamespace
@@ -13,15 +12,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 
 
-TEST_DATA_DIR = tempfile.mkdtemp(prefix="vpk-uploader-lan-test-")
-os.environ["DATA_DIR"] = TEST_DATA_DIR
-os.environ["TMP_DIR"] = os.path.join(TEST_DATA_DIR, "tmp")
-os.environ["LAN_NODE_ID"] = "node-b"
-os.environ["LAN_GROUP"] = "room-1"
-os.environ["LAN_PEER_API_TOKEN"] = "b" * 64
-os.environ["LAN_PEER_ALLOWED_CIDRS"] = "10.20.0.0/24"
-os.environ["LAN_DISK_RESERVE_MB"] = "0"
-os.environ["CHUNK_UPLOAD_DISK_RESERVE_MB"] = "0"
+from tests._bootstrap import DATA_DIR as TEST_DATA_DIR  # noqa: E402  必须先于 app.main 导入
 
 from starlette.datastructures import UploadFile  # noqa: E402
 
@@ -45,10 +36,6 @@ def valid_result() -> ValidationResult:
 
 
 class LanReplicationStorageTest(unittest.TestCase):
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(TEST_DATA_DIR, ignore_errors=True)
-
     def setUp(self):
         db = SessionLocal()
         try:

@@ -24,7 +24,7 @@ from itsdangerous import URLSafeSerializer, BadSignature
 from .vpkcheck import validate_vpk, ValidationResult
 from .vpk_tools import process_server_vpk
 from .vpk_reader import open_vpk
-from .db import init_db, SessionLocal, Upload, AppSetting, ReplicationReservation
+from .db import init_db, SessionLocal, Upload, AppSetting, ReplicationReservation, WorkshopJob
 from .docker_manager import DockerManager
 from .aggregation import client_ip_is_allowed, token_is_valid
 from .chunked_upload import ChunkUploadError, ChunkUploadStore
@@ -34,6 +34,20 @@ from .lan_replication import (
     load_lan_replication_config,
     replicate_artifacts,
 )
+from .steam_workshop import (
+    MAX_ITEMS_PER_JOB,
+    SteamCmdRunner,
+    SteamWebApiClient,
+    WorkshopError,
+    WorkshopItemDetails,
+    collect_vpk_files,
+    details_from_payload,
+    download_direct,
+    looks_like_vpk,
+    load_workshop_config,
+    parse_supplied_details,
+    parse_workshop_ids,
+)
 
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret-change-me")
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
@@ -42,6 +56,7 @@ INSTANCE_NAME = os.getenv("INSTANCE_NAME", "VPK Uploader")
 FEDERATION_API_TOKEN = os.getenv("FEDERATION_API_TOKEN", "")
 FEDERATION_ALLOWED_CIDRS = os.getenv("FEDERATION_ALLOWED_CIDRS", "")
 LAN_REPLICATION = load_lan_replication_config()
+WORKSHOP = load_workshop_config()
 logger = logging.getLogger("vpk_uploader")
 DEFAULT_MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "1024"))
 DEFAULT_TOTAL_UPLOAD_LIMIT_MB = int(os.getenv("MAX_TOTAL_UPLOAD_MB", "0"))
@@ -98,6 +113,13 @@ signer = URLSafeSerializer(APP_SECRET, salt="session")
 init_db()
 _sftp_scan_lock = threading.Lock()
 _sftp_scan_task: Optional[asyncio.Task] = None
+WORKSHOP_API = SteamWebApiClient(WORKSHOP)
+WORKSHOP_STEAMCMD = SteamCmdRunner(WORKSHOP)
+WORKSHOP_JOB_ACTIVE_STATES = ("queued", "running")
+_workshop_queue: Optional[asyncio.Queue] = None
+_workshop_worker_task: Optional[asyncio.Task] = None
+WORKSHOP_CLEANUP_INTERVAL_SECONDS = 300
+_workshop_cleanup_at = 0.0
 
 
 def now_utc() -> datetime:
@@ -748,7 +770,7 @@ def _expiry_for_upload(db, role: str, ttl_hours: Optional[int]) -> Optional[date
 
 
 def _process_vpk_upload(
-    request: Request,
+    uploader_ip: Optional[str],
     role: str,
     ttl_hours: Optional[int],
     tmp_vpk_path: str,
@@ -824,7 +846,7 @@ def _process_vpk_upload(
                 vpk_valid=True,
                 vpk_report=json.dumps(report, ensure_ascii=False),
                 status="active",
-                uploader_ip=request.client.host if request.client else None,
+                uploader_ip=uploader_ip,
             )
             db.add(up)
             db.commit()
@@ -1062,6 +1084,17 @@ def cleanup_tmp_and_work():
     except Exception:
         pass
 
+    # 创意工坊下载会先把 VPK 落到 TMP_DIR；进程在处理途中被杀就会留下大文件。
+    try:
+        for name in os.listdir(TMP_DIR):
+            if not (name.startswith("workshop_") and name.endswith(".vpk")):
+                continue
+            path = os.path.join(TMP_DIR, name)
+            if os.path.isfile(path) and now_ts - os.path.getmtime(path) > WORK_MAX_AGE_MIN * 60:
+                _remove_file_quietly(path)
+    except Exception:
+        pass
+
     # 接收内网复制时先写隐藏分片；进程被强制终止后由这里清理孤立文件。
     try:
         max_partial_age = max(WORK_MAX_AGE_MIN * 60, LAN_REPLICATION.reservation_ttl_seconds)
@@ -1079,6 +1112,7 @@ async def tidy_mw(request: Request, call_next):
     cleanup_tmp_and_work()
     cleanup_expired()
     cleanup_replication_reservations()
+    cleanup_workshop_jobs()
     response = await call_next(request)
     return response
 
@@ -1118,7 +1152,7 @@ async def index(request: Request):
 
 def _process_staged_upload(
     *,
-    request: Request,
+    uploader_ip: Optional[str],
     tmp_upload_path: str,
     original_name: str,
     upload_ext: str,
@@ -1154,7 +1188,7 @@ def _process_staged_upload(
                         "archive_vpk_count": len(archive_members),
                     })
                     up, result = _process_vpk_upload(
-                        request=request,
+                        uploader_ip=uploader_ip,
                         role=role,
                         ttl_hours=ttl_hours,
                         tmp_vpk_path=tmp_vpk_path,
@@ -1184,7 +1218,7 @@ def _process_staged_upload(
                 "uploaded_size": read_bytes,
             }
             up, result = _process_vpk_upload(
-                request=request,
+                uploader_ip=uploader_ip,
                 role=role,
                 ttl_hours=ttl_hours,
                 tmp_vpk_path=tmp_upload_path,
@@ -1246,7 +1280,7 @@ async def _handle_upload(
 
     uploads, results = await asyncio.to_thread(
         _process_staged_upload,
-        request=request,
+        uploader_ip=request.client.host if request.client else None,
         tmp_upload_path=tmp_upload_path,
         original_name=original_name,
         upload_ext=upload_ext,
@@ -2021,6 +2055,7 @@ def federation_summary_payload() -> dict:
             "name": INSTANCE_NAME,
             "upload_count": db.query(Upload).filter(Upload.status == "active").count(),
             "lan_replication": LAN_REPLICATION.public_status(),
+            "workshop": workshop_public_status(db),
             **storage_context(db),
         }
         uploads = [{
@@ -2287,6 +2322,642 @@ def federation_upload_delete(request: Request, item_id: int):
     require_federation_token(request)
     delete_upload_item(item_id)
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Steam 创意工坊导入
+#
+# NewAnneWeb 负责面向用户的鉴权和界面，本节点只暴露受 FEDERATION_API_TOKEN 保护的
+# 异步任务接口：POST 建任务立即返回 job_id，GET 轮询进度。下载完成的 VPK 直接进入
+# 既有的"校验 → 服务器版 → 入库 → 内网复制"流水线。
+# ---------------------------------------------------------------------------
+
+_WORKSHOP_NAME_BAD_CHARS = set('\\/:*?"<>|')
+
+
+def workshop_public_status(db) -> dict[str, Any]:
+    status = WORKSHOP.public_status()
+    status["active_jobs"] = db.query(WorkshopJob).filter(
+        WorkshopJob.status.in_(WORKSHOP_JOB_ACTIVE_STATES)
+    ).count()
+    return status
+
+
+def _workshop_json(raw: Optional[str], fallback):
+    try:
+        value = json.loads(raw) if raw else fallback
+    except (TypeError, ValueError):
+        return fallback
+    return value
+
+
+def _workshop_job_items(job: WorkshopJob) -> list[dict[str, Any]]:
+    items = _workshop_json(job.items, [])
+    return items if isinstance(items, list) else []
+
+
+def _workshop_job_payload(job: WorkshopJob) -> dict[str, Any]:
+    items = _workshop_job_items(job)
+    counts: dict[str, int] = {}
+    uploads: list[dict[str, Any]] = []
+    for item in items:
+        state = str(item.get("state") or "pending")
+        counts[state] = counts.get(state, 0) + 1
+        uploads.extend(item.get("uploads") or [])
+    request_payload = _workshop_json(job.request, {})
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "role": job.role,
+        "ttl_hours": job.ttl_hours,
+        "request": request_payload if isinstance(request_payload, dict) else {},
+        "items": items,
+        "item_total": len(items),
+        "item_counts": counts,
+        "upload_count": len(uploads),
+        "uploads": uploads,
+        "replication": _workshop_json(job.replication, None),
+        "error": job.error,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+        "status_url": _public_url(f"/api/federation/workshop/{job.id}"),
+    }
+
+
+def _save_workshop_items(job_id: str, items: list[dict[str, Any]]) -> None:
+    db = SessionLocal()
+    try:
+        job = db.get(WorkshopJob, job_id)
+        if job is None:
+            return
+        job.items = json.dumps(items, ensure_ascii=False)
+        db.commit()
+    finally:
+        db.close()
+
+
+def _finish_workshop_job(job_id: str, status: str, error: Optional[str] = None) -> None:
+    db = SessionLocal()
+    try:
+        job = db.get(WorkshopJob, job_id)
+        if job is None:
+            return
+        job.status = status
+        job.error = error
+        job.finished_at = now_utc()
+        db.commit()
+    finally:
+        db.close()
+
+
+def _store_workshop_replication(job_id: str, replication: dict[str, Any]) -> None:
+    db = SessionLocal()
+    try:
+        job = db.get(WorkshopJob, job_id)
+        if job is None:
+            return
+        job.replication = json.dumps(replication, ensure_ascii=False)
+        db.commit()
+    finally:
+        db.close()
+
+
+def _workshop_replication_artifacts(upload_ids: list[int]) -> list[ReplicationArtifact]:
+    db = SessionLocal()
+    try:
+        rows = db.query(Upload).filter(
+            Upload.id.in_(upload_ids),
+            Upload.status == "active",
+        ).all()
+        return _replication_artifacts_for_uploads(rows)
+    finally:
+        db.close()
+
+
+def _workshop_available_bytes() -> int:
+    db = SessionLocal()
+    try:
+        return int(replication_storage_snapshot(db)["available_bytes"])
+    finally:
+        db.close()
+
+
+def _workshop_vpk_filename(
+    details: Optional[WorkshopItemDetails],
+    workshop_id: str,
+    index: int,
+    total: int,
+) -> str:
+    """用创意工坊标题生成 VPK 文件名，附带物品 ID 方便回溯。"""
+    title = details.display_title if details is not None else f"workshop_{workshop_id}"
+    cleaned = "".join(
+        "_" if (ch in _WORKSHOP_NAME_BAD_CHARS or ord(ch) < 32) else ch for ch in title
+    )
+    cleaned = cleaned.strip().strip(". ")[:120].strip()
+    if not cleaned:
+        cleaned = f"workshop_{workshop_id}"
+    suffix = f"_{index}" if total > 1 else ""
+    return f"{cleaned}_{workshop_id}{suffix}.vpk"
+
+
+def _workshop_stage_downloads(
+    workshop_id: str,
+    details: Optional[WorkshopItemDetails],
+    upload_max_mb: int,
+) -> tuple[list[str], str]:
+    """把一个创意工坊物品的 VPK 取到 TMP_DIR，返回（本地路径列表，下载方式）。"""
+    max_bytes = upload_max_mb * 1024 * 1024
+
+    if details is not None:
+        if details.banned:
+            raise WorkshopError(f"该物品已被 Steam 封禁：{details.ban_reason or '未说明原因'}")
+        if WORKSHOP.enforce_appid and details.consumer_app_id and details.consumer_app_id != WORKSHOP.appid:
+            raise WorkshopError(
+                f"物品属于 appid {details.consumer_app_id}，本节点只接受 appid {WORKSHOP.appid}"
+            )
+        # file_size 只有在确实存在老式内容文件时才是 VPK 的大小，否则是预览图大小。
+        if details.has_legacy_vpk and details.file_size:
+            if details.file_size > max_bytes:
+                raise WorkshopError(
+                    f"创意工坊文件 {_format_mb(details.file_size)}，超过单文件上限 {upload_max_mb} MB"
+                )
+            available = _workshop_available_bytes()
+            if details.file_size > available:
+                raise WorkshopError(
+                    f"节点可用容量不足：本次需要 {_format_mb(details.file_size)}，"
+                    f"当前可用 {_format_mb(available)}"
+                )
+
+    # 旧版 UGC 带真正的 file_url，直接 HTTPS 取回比拉一次 steamcmd 快得多。
+    if details is not None and details.has_legacy_vpk and WORKSHOP.direct_download_enabled:
+        dest = os.path.join(TMP_DIR, f"workshop_{workshop_id}_{secrets.token_hex(4)}.vpk")
+        try:
+            download_direct(details, dest, max_bytes, WORKSHOP.download_timeout_seconds)
+            if not looks_like_vpk(dest):
+                raise WorkshopError("创意工坊直链返回的不是 VPK 文件")
+            return [dest], "direct"
+        except WorkshopError as exc:
+            _remove_file_quietly(dest)
+            if not WORKSHOP_STEAMCMD.available:
+                raise
+            logger.warning("workshop direct download failed item=%s error=%s", workshop_id, exc)
+
+    content_dir = WORKSHOP_STEAMCMD.download(workshop_id)
+    staged: list[str] = []
+    try:
+        sources = collect_vpk_files(content_dir)
+        if not sources:
+            raise WorkshopError("创意工坊物品里没有 .vpk 文件")
+        for source_path in sources:
+            size = os.path.getsize(source_path)
+            if size > max_bytes:
+                raise WorkshopError(
+                    f"{os.path.basename(source_path)} 为 {_format_mb(size)}，"
+                    f"超过单文件上限 {upload_max_mb} MB"
+                )
+            dest = os.path.join(TMP_DIR, f"workshop_{workshop_id}_{secrets.token_hex(4)}.vpk")
+            shutil.move(source_path, dest)
+            staged.append(dest)
+    except Exception:
+        for path in staged:
+            _remove_file_quietly(path)
+        raise
+    finally:
+        WORKSHOP_STEAMCMD.cleanup(workshop_id)
+    return staged, "steamcmd"
+
+
+def _workshop_import_item(
+    job_id: str,
+    items: list[dict[str, Any]],
+    item: dict[str, Any],
+    details: Optional[WorkshopItemDetails],
+    role: str,
+    ttl_hours: Optional[int],
+    upload_max_mb: int,
+) -> list[int]:
+    """下载并入库单个物品，就地更新 item 状态，返回新建的 Upload id。"""
+    workshop_id = item["workshop_id"]
+    if details is not None:
+        item["title"] = details.display_title
+        item["file_size"] = details.file_size
+    item["state"] = "downloading"
+    _save_workshop_items(job_id, items)
+
+    try:
+        staged, download_source = _workshop_stage_downloads(workshop_id, details, upload_max_mb)
+    except WorkshopError as exc:
+        item["state"] = "failed"
+        item["error"] = str(exc)
+        return []
+    except Exception as exc:
+        logger.exception("workshop download crashed item=%s", workshop_id)
+        item["state"] = "failed"
+        item["error"] = f"下载失败：{exc}"
+        return []
+
+    item["download_source"] = download_source
+    item["state"] = "processing"
+    _save_workshop_items(job_id, items)
+
+    upload_ids: list[int] = []
+    failures: list[dict[str, str]] = []
+    try:
+        for index, tmp_vpk_path in enumerate(staged, start=1):
+            display_name = _workshop_vpk_filename(details, workshop_id, index, len(staged))
+            try:
+                upload_source = {
+                    "source": "steam_workshop",
+                    "workshop_id": workshop_id,
+                    "workshop_title": details.display_title if details is not None else None,
+                    "workshop_url": f"https://steamcommunity.com/sharedfiles/filedetails/?id={workshop_id}",
+                    "download_source": download_source,
+                    "uploaded_name": os.path.basename(tmp_vpk_path),
+                    "source_vpk_name": display_name,
+                    "uploaded_size": os.path.getsize(tmp_vpk_path),
+                    "workshop_vpk_index": index,
+                    "workshop_vpk_count": len(staged),
+                }
+                up, result = _process_vpk_upload(
+                    uploader_ip=f"workshop:{workshop_id}"[:64],
+                    role=role,
+                    ttl_hours=ttl_hours,
+                    tmp_vpk_path=tmp_vpk_path,
+                    source_vpk_name=display_name,
+                    upload_sha256=_sha256_file(tmp_vpk_path),
+                    upload_source=upload_source,
+                    upload_max_mb=upload_max_mb,
+                )
+            except HTTPException as exc:
+                failures.append({"name": display_name, "error": str(exc.detail)})
+                continue
+            except Exception as exc:
+                logger.exception("workshop vpk processing crashed item=%s", workshop_id)
+                failures.append({"name": display_name, "error": f"处理失败：{exc}"})
+                continue
+            if up is None:
+                failures.append({"name": display_name, "error": result.get("error", "VPK 不符合要求")})
+                if result.get("report"):
+                    item["report"] = result["report"]
+                continue
+            upload_ids.append(int(up.id))
+            item["uploads"].append(result)
+    finally:
+        # _process_vpk_upload 会消费掉临时文件，这里只兜底清理没走到的路径。
+        for tmp_vpk_path in staged:
+            _remove_file_quietly(tmp_vpk_path)
+
+    item["failed"] = failures
+    if item["uploads"]:
+        item["state"] = "succeeded" if not failures else "partial"
+    else:
+        item["state"] = "failed"
+        item["error"] = failures[0]["error"] if failures else "没有生成服务器版 VPK"
+    return upload_ids
+
+
+def _run_workshop_job(job_id: str) -> list[int]:
+    db = SessionLocal()
+    try:
+        job = db.get(WorkshopJob, job_id)
+        if job is None:
+            logger.warning("workshop job vanished job_id=%s", job_id)
+            return []
+        job.status = "running"
+        job.started_at = now_utc()
+        db.commit()
+        role = str(job.role or "admin")
+        ttl_hours = job.ttl_hours
+        request_payload = _workshop_json(job.request, {})
+    finally:
+        db.close()
+
+    if not isinstance(request_payload, dict):
+        request_payload = {}
+
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_item(workshop_id: str, origin: str) -> None:
+        if workshop_id in seen or len(items) >= MAX_ITEMS_PER_JOB:
+            return
+        seen.add(workshop_id)
+        items.append({
+            "workshop_id": workshop_id,
+            "origin": origin,
+            "state": "pending",
+            "title": None,
+            "uploads": [],
+            "error": None,
+        })
+
+    for workshop_id in request_payload.get("ids") or []:
+        add_item(str(workshop_id), "item")
+
+    notes: list[str] = []
+    for collection_id in request_payload.get("collections") or []:
+        collection_id = str(collection_id)
+        try:
+            members = WORKSHOP_API.expand_collection(collection_id)
+        except WorkshopError as exc:
+            notes.append(f"合集 {collection_id}：{exc}")
+            continue
+        if not members:
+            notes.append(f"合集 {collection_id}：没有读到成员，可能不是合集或者未公开")
+            continue
+        for member in members:
+            add_item(member, f"collection:{collection_id}")
+
+    if not items:
+        _finish_workshop_job(job_id, "failed", "；".join(notes) or "没有可处理的创意工坊物品")
+        return []
+
+    _save_workshop_items(job_id, items)
+
+    details_by_id: dict[str, WorkshopItemDetails] = {}
+    workshop_ids = [item["workshop_id"] for item in items]
+
+    # 上游带来的元数据优先：它那边能访问 Steam Web API，节点这边未必能。
+    supplied = request_payload.get("details")
+    supplied = supplied if isinstance(supplied, dict) else {}
+    for workshop_id in workshop_ids:
+        candidate = details_from_payload(workshop_id, supplied.get(workshop_id), WORKSHOP.appid)
+        if candidate is not None:
+            details_by_id[workshop_id] = candidate
+    if details_by_id:
+        logger.info(
+            "workshop job %s using caller-supplied details for %s/%s items",
+            job_id, len(details_by_id), len(workshop_ids),
+        )
+
+    pending_ids = [item_id for item_id in workshop_ids if item_id not in details_by_id]
+    for start in range(0, len(pending_ids), 50):
+        chunk = pending_ids[start:start + 50]
+        try:
+            details_by_id.update(WORKSHOP_API.get_details(chunk))
+        except WorkshopError as exc:
+            # 拿不到元数据不阻断下载，只是少了标题、大小预检和直链加速。
+            logger.warning("workshop details lookup failed: %s", exc)
+            notes.append(f"读取物品信息失败：{exc}")
+
+    db = SessionLocal()
+    try:
+        upload_max_mb = get_upload_max_mb(db)
+    finally:
+        db.close()
+
+    upload_ids: list[int] = []
+    for item in items:
+        upload_ids.extend(_workshop_import_item(
+            job_id=job_id,
+            items=items,
+            item=item,
+            details=details_by_id.get(item["workshop_id"]),
+            role=role,
+            ttl_hours=ttl_hours,
+            upload_max_mb=upload_max_mb,
+        ))
+        _save_workshop_items(job_id, items)
+
+    done = sum(1 for item in items if item["state"] in ("succeeded", "partial"))
+    if done == len(items):
+        status = "succeeded"
+    elif done:
+        status = "partial"
+    else:
+        status = "failed"
+    _finish_workshop_job(job_id, status, "；".join(notes) or None)
+    logger.info(
+        "workshop job finished job_id=%s status=%s items=%s uploads=%s",
+        job_id, status, len(items), len(upload_ids),
+    )
+    return upload_ids
+
+
+async def _workshop_worker_loop() -> None:
+    queue = _workshop_queue
+    if queue is None:
+        return
+    while True:
+        job_id = await queue.get()
+        try:
+            upload_ids = await asyncio.to_thread(_run_workshop_job, job_id)
+            if upload_ids:
+                artifacts = await asyncio.to_thread(_workshop_replication_artifacts, upload_ids)
+                replication = await replicate_artifacts(LAN_REPLICATION, artifacts)
+                await asyncio.to_thread(_store_workshop_replication, job_id, replication)
+                logger.info(
+                    "workshop lan replication job=%s peers=%s completed=%s skipped=%s failed=%s",
+                    job_id,
+                    len(replication.get("peers", [])),
+                    replication.get("completed_peer_count", 0),
+                    replication.get("skipped_peer_count", 0),
+                    replication.get("failed_peer_count", 0),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("workshop job crashed job_id=%s", job_id)
+            try:
+                await asyncio.to_thread(
+                    _finish_workshop_job, job_id, "failed", "任务执行异常，请查看节点日志"
+                )
+            except Exception:
+                logger.exception("workshop job failure could not be recorded job_id=%s", job_id)
+        finally:
+            queue.task_done()
+
+
+def _fail_orphaned_workshop_jobs() -> None:
+    """进程重启会丢掉队列，把留在队列/执行中的任务标记为失败，让上游能重试。"""
+    db = SessionLocal()
+    try:
+        rows = db.query(WorkshopJob).filter(
+            WorkshopJob.status.in_(WORKSHOP_JOB_ACTIVE_STATES)
+        ).all()
+        for row in rows:
+            row.status = "failed"
+            row.error = "节点重启导致任务中断，请重新触发"
+            row.finished_at = now_utc()
+        if rows:
+            db.commit()
+            logger.info("workshop jobs interrupted by restart: %s", len(rows))
+    finally:
+        db.close()
+
+
+def cleanup_workshop_jobs() -> None:
+    global _workshop_cleanup_at
+    now_ts = time.time()
+    if now_ts - _workshop_cleanup_at < WORKSHOP_CLEANUP_INTERVAL_SECONDS:
+        return
+    _workshop_cleanup_at = now_ts
+
+    cutoff = now_utc() - timedelta(hours=WORKSHOP.job_retention_hours)
+    db = SessionLocal()
+    try:
+        # 只取 id 和时间，任务记录里的 items JSON 可能很大，不要为清理把它读出来。
+        rows = db.query(WorkshopJob.id, WorkshopJob.created_at).filter(
+            WorkshopJob.status.notin_(WORKSHOP_JOB_ACTIVE_STATES)
+        ).all()
+        expired = [
+            job_id for job_id, created_at in rows
+            if (_as_aware_utc(created_at) or cutoff) < cutoff
+        ]
+        if expired:
+            db.query(WorkshopJob).filter(WorkshopJob.id.in_(expired)).delete(
+                synchronize_session=False
+            )
+            db.commit()
+    finally:
+        db.close()
+
+
+@app.on_event("startup")
+async def start_workshop_worker() -> None:
+    global _workshop_queue, _workshop_worker_task
+    if _workshop_queue is None:
+        _workshop_queue = asyncio.Queue()
+    await asyncio.to_thread(_fail_orphaned_workshop_jobs)
+    if _workshop_worker_task is None or _workshop_worker_task.done():
+        _workshop_worker_task = asyncio.create_task(_workshop_worker_loop())
+
+
+@app.on_event("shutdown")
+async def stop_workshop_worker() -> None:
+    global _workshop_worker_task
+    task = _workshop_worker_task
+    _workshop_worker_task = None
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+def _workshop_request_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+    try:
+        ids = parse_workshop_ids(payload.get("items", payload.get("ids")))
+        collections = parse_workshop_ids(payload.get("collections", payload.get("collection_id")))
+    except WorkshopError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not ids and not collections:
+        raise HTTPException(status_code=400, detail="请至少提供一个创意工坊物品 ID / 链接或合集 ID")
+
+    ttl_hours = payload.get("ttl_hours")
+    if ttl_hours is not None:
+        try:
+            ttl_hours = max(0, int(ttl_hours))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="ttl_hours 必须是整数") from None
+
+    # 上游（NewAnneWeb）可以把已经查好的 Steam 元数据一起带过来，
+    # 这样节点不必自己访问 api.steampowered.com —— 很多机房连不上它。
+    try:
+        details = parse_supplied_details(payload.get("details"))
+    except WorkshopError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {"ids": ids, "collections": collections, "ttl_hours": ttl_hours, "details": details}
+
+
+def _create_workshop_job(parsed: dict[str, Any], source_ip: Optional[str]) -> dict[str, Any]:
+    db = SessionLocal()
+    try:
+        active = db.query(WorkshopJob).filter(
+            WorkshopJob.status.in_(WORKSHOP_JOB_ACTIVE_STATES)
+        ).count()
+        if active >= WORKSHOP.max_queued_jobs:
+            raise HTTPException(
+                status_code=429,
+                detail=f"创意工坊导入队列已满（{active} 个任务未完成），请稍后再试",
+            )
+        job = WorkshopJob(
+            id=secrets.token_hex(16),
+            status="queued",
+            role="admin",
+            ttl_hours=parsed["ttl_hours"],
+            request=json.dumps(
+                {
+                    "ids": parsed["ids"],
+                    "collections": parsed["collections"],
+                    "details": parsed.get("details") or {},
+                },
+                ensure_ascii=False,
+            ),
+            items="[]",
+            source_ip=(source_ip or "")[:64] or None,
+            created_at=now_utc(),
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        return _workshop_job_payload(job)
+    finally:
+        db.close()
+
+
+@app.post("/api/federation/workshop", status_code=202)
+async def federation_workshop_import(request: Request):
+    require_federation_token(request)
+    if not WORKSHOP.steamcmd_available() and not WORKSHOP.direct_download_enabled:
+        raise HTTPException(status_code=503, detail="当前节点没有可用的创意工坊下载方式")
+    if _workshop_queue is None:
+        raise HTTPException(status_code=503, detail="创意工坊导入后台任务尚未启动")
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="请求体不是合法 JSON") from exc
+
+    parsed = _workshop_request_payload(payload)
+    job = await asyncio.to_thread(
+        _create_workshop_job, parsed, request.client.host if request.client else None
+    )
+    _workshop_queue.put_nowait(job["job_id"])
+    logger.info(
+        "workshop job queued job_id=%s items=%s collections=%s",
+        job["job_id"], len(parsed["ids"]), len(parsed["collections"]),
+    )
+    return {"ok": True, **job}
+
+
+@app.get("/api/federation/workshop")
+def federation_workshop_jobs(request: Request, limit: int = 20):
+    require_federation_token(request)
+    limit = max(1, min(100, limit))
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(WorkshopJob)
+            .order_by(WorkshopJob.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return {
+            "generated_at": now_utc().isoformat(),
+            "workshop": workshop_public_status(db),
+            "jobs": [_workshop_job_payload(row) for row in rows],
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/federation/workshop/{job_id}")
+def federation_workshop_job(request: Request, job_id: str):
+    require_federation_token(request)
+    db = SessionLocal()
+    try:
+        job = db.get(WorkshopJob, job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="导入任务不存在")
+        return _workshop_job_payload(job)
+    finally:
+        db.close()
 
 
 @app.post("/admin/settings")
