@@ -116,6 +116,8 @@ _sftp_scan_task: Optional[asyncio.Task] = None
 WORKSHOP_API = SteamWebApiClient(WORKSHOP)
 WORKSHOP_STEAMCMD = SteamCmdRunner(WORKSHOP)
 WORKSHOP_JOB_ACTIVE_STATES = ("queued", "running")
+WORKSHOP_ROLES = ("guest", "admin")
+WORKSHOP_DEFAULT_ROLE = "guest"
 _workshop_queue: Optional[asyncio.Queue] = None
 _workshop_worker_task: Optional[asyncio.Task] = None
 WORKSHOP_CLEANUP_INTERVAL_SECONDS = 300
@@ -734,7 +736,22 @@ def _upload_item_result(up: Upload) -> dict:
         "size_label": _format_mb(up.size or 0),
         "detail_url": f"/detail/{up.id}",
         "download_url": f"/d/{up.id}",
+        "role": up.role,
+        "expires_at": up.expires_at.isoformat() if up.expires_at else None,
     }
+
+
+def _extend_expiry(existing: Upload, expires_at: Optional[datetime]) -> None:
+    """同一个文件再传一次就续期：永久的保持永久，有期限的取更晚的那个。"""
+    current = _as_aware_utc(existing.expires_at)
+    if current is None:
+        return
+    if expires_at is None:
+        existing.expires_at = None
+        return
+    candidate = _as_aware_utc(expires_at)
+    if candidate is not None and candidate > current:
+        existing.expires_at = expires_at
 
 
 def _find_active_upload_by_sha256(db, sha256: str, size: int) -> Optional[Upload]:
@@ -821,6 +838,7 @@ def _process_vpk_upload(
             existing = _find_active_upload_by_sha256(db, server_sha256, server_size)
             if existing is not None:
                 _remove_file_quietly(server_path)
+                _extend_expiry(existing, expires_at)
                 db.commit()
                 result = _upload_item_result(existing)
                 result["deduplicated"] = True
@@ -2244,12 +2262,16 @@ def lan_replication_complete(request: Request, reservation_id: str):
 
 
 @app.post("/api/federation/uploads")
-async def federation_upload(request: Request, file: UploadFile):
+async def federation_upload(request: Request, file: UploadFile, role: str = Form("admin")):
     require_federation_token(request)
+    # 缺省仍按管理员处理（聚合后台的手动上传）；NewAnneWeb 替玩家部署时传 guest。
+    role = (role or "admin").strip().lower()
+    if role not in WORKSHOP_ROLES:
+        raise HTTPException(status_code=400, detail="role 只能是 guest 或 admin")
     uploads, results, _ = await _handle_upload(
         request,
         file,
-        role="admin",
+        role=role,
         ttl_hours=None,
         render_error=False,
     )
@@ -2340,6 +2362,14 @@ def workshop_public_status(db) -> dict[str, Any]:
     status["active_jobs"] = db.query(WorkshopJob).filter(
         WorkshopJob.status.in_(WORKSHOP_JOB_ACTIVE_STATES)
     ).count()
+    # steamcmd_available 只说明镜像里有它；能不能真的用要看连不连得上自更新服务器。
+    ready, reason = WORKSHOP_STEAMCMD.readiness()
+    status["steamcmd_ready"] = ready
+    status["steamcmd_error"] = "" if ready else reason
+    # 创意工坊导入默认按普通用户（无管理员）的规则入库：保存时间和单文件上限都跟网页上传一致。
+    status["default_role"] = WORKSHOP_DEFAULT_ROLE
+    status["upload_max_mb"] = get_upload_max_mb(db)
+    status["guest_ttl_hours"] = get_guest_ttl_hours(db)
     return status
 
 
@@ -2822,6 +2852,7 @@ async def start_workshop_worker() -> None:
     await asyncio.to_thread(_fail_orphaned_workshop_jobs)
     if _workshop_worker_task is None or _workshop_worker_task.done():
         _workshop_worker_task = asyncio.create_task(_workshop_worker_loop())
+    WORKSHOP_STEAMCMD.refresh_readiness_async()
 
 
 @app.on_event("shutdown")
@@ -2849,12 +2880,19 @@ def _workshop_request_payload(payload: Any) -> dict[str, Any]:
     if not ids and not collections:
         raise HTTPException(status_code=400, detail="请至少提供一个创意工坊物品 ID / 链接或合集 ID")
 
+    role = str(payload.get("role") or WORKSHOP_DEFAULT_ROLE).strip().lower()
+    if role not in WORKSHOP_ROLES:
+        raise HTTPException(status_code=400, detail="role 只能是 guest 或 admin")
+
     ttl_hours = payload.get("ttl_hours")
     if ttl_hours is not None:
         try:
             ttl_hours = max(0, int(ttl_hours))
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="ttl_hours 必须是整数") from None
+    if role == "guest":
+        # 普通用户的保存时间只由节点后台的「普通用户保存时间」决定，调用方改不了。
+        ttl_hours = None
 
     # 上游（NewAnneWeb）可以把已经查好的 Steam 元数据一起带过来，
     # 这样节点不必自己访问 api.steampowered.com —— 很多机房连不上它。
@@ -2863,7 +2901,7 @@ def _workshop_request_payload(payload: Any) -> dict[str, Any]:
     except WorkshopError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    return {"ids": ids, "collections": collections, "ttl_hours": ttl_hours, "details": details}
+    return {"ids": ids, "collections": collections, "role": role, "ttl_hours": ttl_hours, "details": details}
 
 
 def _create_workshop_job(parsed: dict[str, Any], source_ip: Optional[str]) -> dict[str, Any]:
@@ -2880,7 +2918,7 @@ def _create_workshop_job(parsed: dict[str, Any], source_ip: Optional[str]) -> di
         job = WorkshopJob(
             id=secrets.token_hex(16),
             status="queued",
-            role="admin",
+            role=parsed.get("role") or WORKSHOP_DEFAULT_ROLE,
             ttl_hours=parsed["ttl_hours"],
             request=json.dumps(
                 {

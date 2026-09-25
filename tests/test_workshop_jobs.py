@@ -83,11 +83,11 @@ class WorkshopJobTestCase(unittest.TestCase):
         for name in os.listdir(main.UPLOAD_DIR):
             main._remove_file_quietly(os.path.join(main.UPLOAD_DIR, name))
 
-    def create_job(self, ids=(), collections=(), ttl_hours=None) -> str:
-        payload = main._create_workshop_job(
-            {"ids": list(ids), "collections": list(collections), "ttl_hours": ttl_hours},
-            "10.0.0.9",
-        )
+    def create_job(self, ids=(), collections=(), ttl_hours=None, role=None) -> str:
+        parsed = {"ids": list(ids), "collections": list(collections), "ttl_hours": ttl_hours}
+        if role is not None:
+            parsed["role"] = role
+        payload = main._create_workshop_job(parsed, "10.0.0.9")
         return payload["job_id"]
 
     def load_job(self, job_id: str) -> dict:
@@ -127,8 +127,12 @@ class RunWorkshopJobTest(WorkshopJobTestCase):
         try:
             upload = db.get(Upload, upload_ids[0])
             self.assertEqual(upload.status, "active")
-            self.assertEqual(upload.role, "admin")
-            self.assertIsNone(upload.expires_at)
+            # 默认按普通用户入库：保存时间跟节点后台的「普通用户保存时间」走（缺省 24 小时）。
+            self.assertEqual(upload.role, "guest")
+            expires_at = main._as_aware_utc(upload.expires_at)
+            self.assertIsNotNone(expires_at)
+            remaining = (expires_at - main.now_utc()).total_seconds()
+            self.assertTrue(23 * 3600 < remaining <= 24 * 3600)
             self.assertEqual(upload.uploader_ip, f"workshop:{ITEM_ID}")
             self.assertTrue(upload.original_name.endswith(f"_{ITEM_ID}.vpk"))
             self.assertTrue(os.path.isfile(os.path.join(main.UPLOAD_DIR, upload.stored_name)))
@@ -138,19 +142,34 @@ class RunWorkshopJobTest(WorkshopJobTestCase):
         finally:
             db.close()
 
-    def test_ttl_hours_sets_expiry(self):
-        job_id = self.create_job(ids=[ITEM_ID], ttl_hours=6)
+    def run_single(self, job_id: str) -> Upload:
         api = FakeWorkshopApi(details={ITEM_ID: details_for(ITEM_ID)})
-
         with patch.object(main, "WORKSHOP_API", api), \
              patch.object(main, "_workshop_stage_downloads", self.stage_real_vpk):
             upload_ids = main._run_workshop_job(job_id)
-
         db = SessionLocal()
         try:
-            self.assertIsNotNone(db.get(Upload, upload_ids[0]).expires_at)
+            upload = db.get(Upload, upload_ids[0])
+            db.expunge(upload)
+            return upload
         finally:
             db.close()
+
+    def test_admin_ttl_hours_sets_expiry(self):
+        upload = self.run_single(self.create_job(ids=[ITEM_ID], ttl_hours=6, role="admin"))
+        self.assertEqual(upload.role, "admin")
+        remaining = (main._as_aware_utc(upload.expires_at) - main.now_utc()).total_seconds()
+        self.assertTrue(5 * 3600 < remaining <= 6 * 3600)
+
+    def test_admin_without_ttl_is_permanent(self):
+        upload = self.run_single(self.create_job(ids=[ITEM_ID], role="admin"))
+        self.assertIsNone(upload.expires_at)
+
+    def test_guest_follows_the_node_guest_ttl_setting(self):
+        main.set_guest_ttl_hours(0)
+        upload = self.run_single(self.create_job(ids=[ITEM_ID]))
+        self.assertEqual(upload.role, "guest")
+        self.assertIsNone(upload.expires_at, "普通用户保存时间设成 0 就是永久")
 
     def test_collection_is_expanded_into_items(self):
         job_id = self.create_job(collections=["900000001"])
@@ -384,6 +403,7 @@ class WorkshopRequestPayloadTest(unittest.TestCase):
         parsed = main._workshop_request_payload({
             "items": f"{ITEM_ID}\nhttps://steamcommunity.com/sharedfiles/filedetails/?id={OTHER_ITEM_ID}",
             "collections": ["900000001"],
+            "role": "admin",
             "ttl_hours": "12",
         })
         self.assertEqual(parsed["ids"], [ITEM_ID, OTHER_ITEM_ID])
@@ -398,8 +418,70 @@ class WorkshopRequestPayloadTest(unittest.TestCase):
 
     def test_rejects_bad_ttl(self):
         with self.assertRaises(main.HTTPException) as ctx:
-            main._workshop_request_payload({"ids": [ITEM_ID], "ttl_hours": "soon"})
+            main._workshop_request_payload({"ids": [ITEM_ID], "role": "admin", "ttl_hours": "soon"})
         self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_role_defaults_to_guest_and_ignores_caller_ttl(self):
+        parsed = main._workshop_request_payload({"ids": [ITEM_ID], "ttl_hours": 9999})
+        self.assertEqual(parsed["role"], "guest")
+        self.assertIsNone(parsed["ttl_hours"], "普通用户的保存时间只能由节点后台决定")
+
+    def test_admin_role_keeps_ttl(self):
+        parsed = main._workshop_request_payload({"ids": [ITEM_ID], "role": "Admin", "ttl_hours": 12})
+        self.assertEqual(parsed["role"], "admin")
+        self.assertEqual(parsed["ttl_hours"], 12)
+
+    def test_rejects_unknown_role(self):
+        with self.assertRaises(main.HTTPException) as ctx:
+            main._workshop_request_payload({"ids": [ITEM_ID], "role": "root"})
+        self.assertEqual(ctx.exception.status_code, 400)
+
+
+class ExtendExpiryTest(unittest.TestCase):
+    """同一张图再部署一次要续期，不能因为去重就沿用快过期的旧记录。"""
+
+    def upload(self, expires_at):
+        return Upload(original_name="a.vpk", stored_name="a.vpk", role="guest", expires_at=expires_at)
+
+    def test_later_expiry_wins(self):
+        soon = main.now_utc() + main.timedelta(hours=1)
+        later = main.now_utc() + main.timedelta(hours=24)
+        existing = self.upload(soon)
+        main._extend_expiry(existing, later)
+        self.assertEqual(existing.expires_at, later)
+
+    def test_earlier_expiry_does_not_shorten(self):
+        later = main.now_utc() + main.timedelta(hours=24)
+        existing = self.upload(later)
+        main._extend_expiry(existing, main.now_utc() + main.timedelta(hours=1))
+        self.assertEqual(existing.expires_at, later)
+
+    def test_permanent_stays_permanent(self):
+        existing = self.upload(None)
+        main._extend_expiry(existing, main.now_utc() + main.timedelta(hours=1))
+        self.assertIsNone(existing.expires_at)
+
+    def test_permanent_upload_makes_existing_permanent(self):
+        existing = self.upload(main.now_utc() + main.timedelta(hours=1))
+        main._extend_expiry(existing, None)
+        self.assertIsNone(existing.expires_at)
+
+
+class WorkshopPublicStatusTest(WorkshopJobTestCase):
+    def test_reports_real_steamcmd_readiness_and_guest_defaults(self):
+        main.set_guest_ttl_hours(48)
+        main.set_upload_max_mb(300)
+        db = SessionLocal()
+        try:
+            with patch.object(main.WORKSHOP_STEAMCMD, "readiness", return_value=(False, "无法解析 client-download.steampowered.com")):
+                status = main.workshop_public_status(db)
+        finally:
+            db.close()
+        self.assertFalse(status["steamcmd_ready"])
+        self.assertIn("client-download", status["steamcmd_error"])
+        self.assertEqual(status["default_role"], "guest")
+        self.assertEqual(status["upload_max_mb"], 300)
+        self.assertEqual(status["guest_ttl_hours"], 48)
 
 
 class WorkshopJobLifecycleTest(WorkshopJobTestCase):

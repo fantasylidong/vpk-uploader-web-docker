@@ -114,8 +114,7 @@ curl -X POST https://node.example.com/api/federation/workshop \
   -H "Authorization: Bearer $FEDERATION_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"items": ["2547462987", "https://steamcommunity.com/sharedfiles/filedetails/?id=1234567890"],
-       "collections": ["900000001"],
-       "ttl_hours": 0}'
+       "collections": ["900000001"]}'
 ```
 
 返回 `202` 和任务信息，其中 `status_url` 就是轮询地址：
@@ -149,7 +148,12 @@ curl -X POST https://node.example.com/api/federation/workshop \
 }
 ```
 
-`ttl_hours` 省略或填 `0` 表示永久保留，和管理员上传一致。入库后的文件会出现在 `/api/thirdparty-maps`，并按内网组复制到同组节点。
+导入默认按**普通用户（无管理员）**的规则入库（`role` 缺省为 `guest`）：
+
+- 保存时间取后台的「普通用户保存时间」（`guest_ttl_hours`，设成 0 表示永久），调用方传的 `ttl_hours` 会被忽略；
+- 单文件大小上限和网页上传一样，取后台的「单文件上传上限」（`upload_max_mb`）。
+
+需要按管理员规则长期保留时显式传 `"role": "admin"`，这时 `ttl_hours` 省略或填 `0` 表示永久保留，和管理员上传一致。同一个文件再导入一次会续期：有期限的取更晚的过期时间，永久的保持永久。入库后的文件会出现在 `/api/thirdparty-maps`，并按内网组复制到同组节点。
 
 ### 上游可以把直链一起带过来
 
@@ -181,12 +185,14 @@ curl -X POST https://node.example.com/api/federation/workshop \
 ### 两条下载通道
 
 1. **直链**：`file_url` 来自上游带来的 `details`，或者节点自己查 Steam Web API。直接 HTTPS 取回，不需要 steamcmd，arm64 节点也能用。物品内容托管在 SteamPipe 上时 Steam 返回的 `file_url` 会退化成预览图地址，节点会识别出来并跳过这条通道。
-2. **steamcmd**：以匿名身份执行 `workshop_download_item`，覆盖直链拿不到的物品。**注意它依赖 `client-download.steampowered.com` 做自更新，实测三台生产节点全都解析不了这个域名，所以国内机房基本只能靠直链通道。**
+2. **steamcmd**：以匿名身份执行 `workshop_download_item`，覆盖直链拿不到的物品。**注意它依赖 `client-download.steampowered.com` 做自更新，实测三台生产节点全都解析不了这个域名，所以国内机房基本只能靠直链通道。** 节点会探测这个域名能不能连上（见下文 `steamcmd_ready`），连不上时走 steamcmd 的物品直接失败，不再白白重试三轮。
 
 ### steamcmd 的两个前提
 
 - **只有 amd64**。steamcmd 仅发布 32 位 x86 版本，`linux/arm64` 镜像照常构建但不含 steamcmd，此时只有直链通道可用，走 steamcmd 的物品会明确报错。
 - **需要能访问 `client-download.steampowered.com`**。steamcmd 每次启动都会自更新，这个域名解析不了就会静默退出。节点会把它自己的 `bootstrap_log.txt` 里的失败行拼进错误信息，例如 `steamcmd 退出码 1（Download failed: http error 0 (client-download.steampowered.com/client/steam_cmd_linux)）`，方便直接定位是网络问题。国内机器构建镜像时还可以用 `--build-arg STEAMCMD_URL=<镜像地址>` 换掉 steamcmd 安装包的下载源。
+
+节点启动时和之后每隔 `STEAMCMD_PROBE_TTL_SECONDS`（默认 600 秒）会在后台探测一次 `STEAMCMD_UPDATE_HOST`（默认 `client-download.steampowered.com`）的 443/80 端口，结果放在 `site.workshop.steamcmd_ready`，失败原因在 `steamcmd_error`。`steamcmd_available` 只表示镜像里带了 steamcmd，**上游判断能不能走 steamcmd 应该看 `steamcmd_ready`**。steamcmd 实际运行时因为自更新失败退出，也会立刻把 `steamcmd_ready` 置为 false。
 
 首次调用会把镜像里的 steamcmd 复制到 `/app/data/steamcmd` 再运行，自更新和下载缓存都留在数据卷里，容器重建不用重下。任务串行执行（steamcmd 不支持并发使用同一个安装目录），未完成任务超过 `STEAM_WORKSHOP_MAX_QUEUED_JOBS` 时接口返回 `429`。节点重启会把队列里和执行中的任务标记为 `failed`，需要 NewAnneWeb 重新触发。
 
@@ -200,6 +206,9 @@ STEAM_WORKSHOP_MAX_QUEUED_JOBS=32
 STEAM_WORKSHOP_DIRECT_DOWNLOAD=1
 STEAM_WORKSHOP_ENFORCE_APPID=1
 STEAM_WORKSHOP_JOB_RETENTION_HOURS=72
+STEAMCMD_UPDATE_HOST=client-download.steampowered.com
+STEAMCMD_PROBE_TTL_SECONDS=600
+STEAMCMD_PROBE_TIMEOUT_SECONDS=5
 ```
 
 `STEAM_WORKSHOP_ENFORCE_APPID=1` 时会拒绝 `consumer_app_id` 不是 `STEAM_WORKSHOP_APPID` 的物品，避免误导入别的游戏的内容。单次任务最多 200 个物品，合集最多向下展开 3 层。
@@ -227,9 +236,9 @@ docker run -d --name vpk-uploader -p 8080:8080   -e APP_SECRET="change-me" -e AD
 
 接口地址：`/api/thirdparty-maps`。`PUBLIC_BASE_URL` 可留空，此时接口返回相对路径，由 NewAnneWeb 按节点地址访问。只有反向代理、NAT 外部端口等与实际监听地址不一致时才需要手动设置。
 
-聚合管理使用 Bearer Token 访问 `/api/federation/`。NewAnneWeb 可通过 `POST /api/federation/uploads` 以 multipart 字段 `file` 将 `.vpk`、`.zip`、`.rar` 或 `.7z` 文件上传到指定节点；该接口与 Docker 管理接口一样受 `FEDERATION_API_TOKEN` 和 `FEDERATION_ALLOWED_CIDRS` 双重限制。
+聚合管理使用 Bearer Token 访问 `/api/federation/`。NewAnneWeb 可通过 `POST /api/federation/uploads` 以 multipart 字段 `file` 将 `.vpk`、`.zip`、`.rar` 或 `.7z` 文件上传到指定节点，可选字段 `role` 为 `admin`（缺省，永久保存）或 `guest`（按普通用户保存时间过期）；该接口与 Docker 管理接口一样受 `FEDERATION_API_TOKEN` 和 `FEDERATION_ALLOWED_CIDRS` 双重限制。
 
-创意工坊导入走 `POST /api/federation/workshop`，用法见上文。`GET /api/federation/summary` 的 `site.workshop` 里带有本节点的创意工坊能力（`steamcmd_available`、`direct_download_enabled`、`active_jobs` 等），NewAnneWeb 可据此决定是否显示导入入口。
+创意工坊导入走 `POST /api/federation/workshop`，用法见上文。`GET /api/federation/summary` 的 `site.workshop` 里带有本节点的创意工坊能力（`steamcmd_ready`、`direct_download_enabled`、`active_jobs` 等）以及导入默认采用的规则（`default_role`、`upload_max_mb`、`guest_ttl_hours`），NewAnneWeb 可据此决定是否显示导入入口、按多大的上限预检。`site.total_upload_available_bytes` 是扣掉预留空间和磁盘余量之后真正还能装下的字节数。
 
 返回示例：
 

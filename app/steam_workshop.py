@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -36,6 +37,9 @@ COLLECTION_FILETYPE = 2
 MAX_COLLECTION_DEPTH = 3
 MAX_ITEMS_PER_JOB = 200
 TRUE_VALUES = {"1", "true", "yes", "on"}
+# steamcmd 每次启动都先找这个域名自更新，连不上就静默退出。
+STEAMCMD_UPDATE_HOST = "client-download.steampowered.com"
+STEAMCMD_PROBE_PORTS = (443, 80)
 
 
 class WorkshopError(Exception):
@@ -97,6 +101,9 @@ class WorkshopConfig:
     direct_download_enabled: bool = True
     enforce_appid: bool = True
     job_retention_hours: int = 72
+    steamcmd_update_host: str = STEAMCMD_UPDATE_HOST
+    steamcmd_probe_ttl_seconds: int = 600
+    steamcmd_probe_timeout_seconds: int = 5
 
     @property
     def steamcmd_script(self) -> str:
@@ -133,6 +140,9 @@ def load_workshop_config(env: Optional[Mapping[str, str]] = None) -> WorkshopCon
         direct_download_enabled=_env_bool(env, "STEAM_WORKSHOP_DIRECT_DOWNLOAD", True),
         enforce_appid=_env_bool(env, "STEAM_WORKSHOP_ENFORCE_APPID", True),
         job_retention_hours=_env_int(env, "STEAM_WORKSHOP_JOB_RETENTION_HOURS", 72, 1, 24 * 30),
+        steamcmd_update_host=(env.get("STEAMCMD_UPDATE_HOST") or STEAMCMD_UPDATE_HOST).strip(),
+        steamcmd_probe_ttl_seconds=_env_int(env, "STEAMCMD_PROBE_TTL_SECONDS", 600, 30, 86400),
+        steamcmd_probe_timeout_seconds=_env_int(env, "STEAMCMD_PROBE_TIMEOUT_SECONDS", 5, 1, 30),
     )
 
 
@@ -356,16 +366,90 @@ class SteamWebApiClient:
         return ordered
 
 
+def probe_tcp_host(host: str, ports: tuple[int, ...], timeout: float) -> tuple[bool, str]:
+    """能解析并连上任意一个端口就算通。steamcmd 自更新失败时什么都不输出，只能先这样探。"""
+    try:
+        socket.getaddrinfo(host, None)
+    except OSError as exc:
+        return False, f"无法解析 {host}（{exc}）"
+    last_error = ""
+    for port in ports:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True, ""
+        except OSError as exc:
+            last_error = str(exc)
+    return False, f"连不上 {host}（{last_error or '超时'}）"
+
+
 class SteamCmdRunner:
     """把镜像内置的 steamcmd 复制到持久化目录后调用，保留自更新与下载缓存。"""
 
-    def __init__(self, config: WorkshopConfig):
+    def __init__(self, config: WorkshopConfig, prober=None):
         self.config = config
         self._lock = threading.Lock()
+        self._prober = prober or probe_tcp_host
+        self._probe_lock = threading.Lock()
+        # (时间戳, 是否可用, 原因)；None 表示还没探测过。
+        self._readiness: Optional[tuple[float, bool, str]] = None
 
     @property
     def available(self) -> bool:
         return self.config.steamcmd_available()
+
+    def _fresh_readiness(self) -> Optional[tuple[bool, str]]:
+        cached = self._readiness
+        if cached is not None and time.monotonic() - cached[0] < self.config.steamcmd_probe_ttl_seconds:
+            return cached[1], cached[2]
+        return None
+
+    def _probe(self, wait: bool = False) -> tuple[bool, str]:
+        if not self._probe_lock.acquire(blocking=wait):
+            cached = self._readiness
+            return (cached[1], cached[2]) if cached else (False, "正在检测 steamcmd 更新服务器")
+        try:
+            # 等锁期间别的线程可能刚探测完，直接用它的结论。
+            fresh = self._fresh_readiness() if wait else None
+            if fresh is not None:
+                return fresh
+            ok, reason = self._prober(
+                self.config.steamcmd_update_host,
+                STEAMCMD_PROBE_PORTS,
+                self.config.steamcmd_probe_timeout_seconds,
+            )
+            self._readiness = (time.monotonic(), ok, reason)
+            if not ok:
+                logger.warning("steamcmd update host unreachable: %s", reason)
+            return ok, reason
+        finally:
+            self._probe_lock.release()
+
+    def readiness(self, block: bool = False) -> tuple[bool, str]:
+        """steamcmd 现在能不能真的用：镜像里有它还不够，还得连得上自更新服务器。
+
+        block=False 时不在调用线程里做网络探测：结果过期就在后台刷新，先返回上一次的结论，
+        从没探测过则当作不可用 —— 宁可让上游暂时拒掉，也别让玩家排一个必败的任务。
+        """
+        if not self.available:
+            return False, "当前镜像没有内置 steamcmd（只支持 amd64）"
+        fresh = self._fresh_readiness()
+        if fresh is not None:
+            return fresh
+        if block:
+            return self._probe(wait=True)
+        self.refresh_readiness_async()
+        cached = self._readiness
+        if cached is not None:
+            return cached[1], cached[2]
+        return False, "正在检测 steamcmd 更新服务器"
+
+    def refresh_readiness_async(self) -> None:
+        if not self.available or self._probe_lock.locked():
+            return
+        threading.Thread(target=self._probe, name="steamcmd-probe", daemon=True).start()
+
+    def _remember(self, ok: bool, reason: str) -> None:
+        self._readiness = (time.monotonic(), ok, reason)
 
     def ensure_installed(self) -> str:
         script = self.config.steamcmd_script
@@ -408,6 +492,10 @@ class SteamCmdRunner:
 
     def download(self, published_file_id: str, log=None) -> str:
         """下载一个创意工坊物品，返回内容目录。失败抛 WorkshopError。"""
+        ready, reason = self.readiness(block=True)
+        if not ready:
+            # 连不上自更新服务器时 steamcmd 每次都会静默退出，重试三轮只是白等。
+            raise WorkshopError(f"steamcmd 当前不可用：{reason}")
         script = self.ensure_installed()
         env = {**os.environ, "HOME": self.config.steamcmd_home}
         last_error = "steamcmd 未返回具体错误"
@@ -438,8 +526,13 @@ class SteamCmdRunner:
                         log(output[-2000:])
                     content = self.content_dir(published_file_id)
                     if content and os.listdir(content):
+                        self._remember(True, "")
                         return content
                     last_error = self._failure_reason(output, completed.returncode)
+                    if self.config.steamcmd_update_host in last_error:
+                        # 自更新失败：记下来让 summary 立刻反映，并且不用再重试了。
+                        self._remember(False, last_error)
+                        break
 
                 logger.warning(
                     "steamcmd download failed item=%s attempt=%s/%s error=%s",

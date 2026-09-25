@@ -3,6 +3,7 @@ import shutil
 import tempfile
 import unittest
 
+from unittest.mock import patch
 from urllib.parse import parse_qs
 
 import httpx
@@ -292,9 +293,6 @@ class CollectVpkFilesTest(unittest.TestCase):
         self.assertEqual(sorted(found), sorted(["a.vpk", os.path.join("nested", "b.VPK")]))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class SuppliedDetailsTest(unittest.TestCase):
     """上游把已经查好的直链带过来，节点就不用自己访问 Steam Web API。
@@ -357,3 +355,68 @@ class SuppliedDetailsTest(unittest.TestCase):
 
     def test_parse_supplied_details_tolerates_absence(self):
         self.assertEqual(parse_supplied_details(None), {})
+
+
+class SteamCmdReadinessTest(unittest.TestCase):
+    """镜像里有 steamcmd 不等于能用：连不上自更新服务器时它每次都会静默退出。"""
+
+    def runner(self, prober, with_dist=True) -> SteamCmdRunner:
+        home = tempfile.mkdtemp(prefix="steamcmd-home-")
+        self.addCleanup(shutil.rmtree, home, True)
+        dist = os.path.join(home, "dist")
+        if with_dist:
+            os.makedirs(dist)
+        config = load_workshop_config({"STEAMCMD_HOME": os.path.join(home, "steamcmd"), "STEAMCMD_DIST": dist})
+        return SteamCmdRunner(config, prober=prober)
+
+    def test_unreachable_update_host_is_not_ready(self):
+        calls = []
+
+        def prober(host, ports, timeout):
+            calls.append(host)
+            return False, f"无法解析 {host}"
+
+        runner = self.runner(prober)
+        ready, reason = runner.readiness(block=True)
+        self.assertFalse(ready)
+        self.assertIn("client-download.steampowered.com", reason)
+        # 结论会缓存，summary 频繁调用也不会反复探测。
+        runner.readiness(block=True)
+        runner.readiness()
+        self.assertEqual(len(calls), 1)
+
+    def test_reachable_update_host_is_ready(self):
+        runner = self.runner(lambda host, ports, timeout: (True, ""))
+        self.assertEqual(runner.readiness(block=True), (True, ""))
+
+    def test_missing_binary_is_never_ready(self):
+        runner = self.runner(lambda host, ports, timeout: (True, ""), with_dist=False)
+        ready, reason = runner.readiness(block=True)
+        self.assertFalse(ready)
+        self.assertIn("没有内置 steamcmd", reason)
+
+    def test_non_blocking_readiness_does_not_claim_ready_before_probing(self):
+        started = []
+
+        def prober(host, ports, timeout):
+            started.append(host)
+            return True, ""
+
+        runner = self.runner(prober)
+        with patch.object(runner, "refresh_readiness_async") as refresh:
+            ready, _ = runner.readiness()
+        self.assertFalse(ready)
+        refresh.assert_called_once()
+        self.assertEqual(started, [])
+
+    def test_download_fails_fast_when_not_ready(self):
+        runner = self.runner(lambda host, ports, timeout: (False, "连不上 client-download.steampowered.com"))
+        with patch("app.steam_workshop.subprocess.run") as run, \
+                self.assertRaises(WorkshopError) as ctx:
+            runner.download("2547462987")
+        run.assert_not_called()
+        self.assertIn("steamcmd 当前不可用", str(ctx.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()
