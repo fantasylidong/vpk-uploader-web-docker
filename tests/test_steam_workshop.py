@@ -15,8 +15,10 @@ from app.steam_workshop import (  # noqa: E402
     WorkshopError,
     WorkshopItemDetails,
     collect_vpk_files,
+    describe_files,
     details_from_payload,
     direct_download_host_allowed,
+    download_direct,
     load_workshop_config,
     looks_like_vpk,
     parse_supplied_details,
@@ -416,6 +418,145 @@ class SteamCmdReadinessTest(unittest.TestCase):
             runner.download("2547462987")
         run.assert_not_called()
         self.assertIn("steamcmd 当前不可用", str(ctx.exception))
+
+
+class DirectDownloadResumeTest(unittest.TestCase):
+    """国内节点连 Steam CDN 常被中途断开：断了要用 Range 接着下，而不是整个失败。"""
+
+    URL = "https://cdn.steamusercontent.com/ugc/1/ABC/"
+    PAYLOAD = b"\x34\x12\xaa\x55" + bytes(range(256)) * 40  # 10244 字节
+
+    def details(self, size=None):
+        return WorkshopItemDetails(
+            published_file_id="2396847377",
+            title="广州增城",
+            file_size=len(self.PAYLOAD) if size is None else size,
+            consumer_app_id=550,
+            filename="zc806.vpk",
+            file_url=self.URL,
+            banned=False,
+            ban_reason="",
+            preview_url="https://images.steamusercontent.com/ugc/2/B/",
+        )
+
+    def dest(self):
+        handle, path = tempfile.mkstemp(suffix=".vpk")
+        os.close(handle)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        return path
+
+    def factory(self, handler):
+        return lambda: httpx.Client(transport=httpx.MockTransport(handler), timeout=5, follow_redirects=True)
+
+    @staticmethod
+    def dropping_stream(data: bytes, cut: int):
+        def generate():
+            yield data[:cut]
+            raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+        return generate()
+
+    def test_resumes_from_where_the_connection_dropped(self):
+        seen = []
+
+        def handler(request):
+            seen.append(request.headers.get("range"))
+            if len(seen) == 1:
+                return httpx.Response(200, headers={"content-length": str(len(self.PAYLOAD))},
+                                      content=self.dropping_stream(self.PAYLOAD, 4000))
+            start = int(request.headers["range"].split("=")[1].rstrip("-"))
+            return httpx.Response(206, headers={"content-range": f"bytes {start}-{len(self.PAYLOAD) - 1}/{len(self.PAYLOAD)}"},
+                                  content=self.PAYLOAD[start:])
+
+        path = self.dest()
+        written = download_direct(self.details(), path, 0, 60, attempts=3,
+                                  client_factory=self.factory(handler), sleep=lambda _: None)
+        self.assertEqual(written, len(self.PAYLOAD))
+        self.assertEqual(seen, [None, "bytes=4000-"])
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), self.PAYLOAD)
+
+    def test_restarts_when_the_server_ignores_range(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request.headers.get("range"))
+            if len(calls) == 1:
+                return httpx.Response(200, content=self.dropping_stream(self.PAYLOAD, 3000))
+            return httpx.Response(200, content=self.PAYLOAD)
+
+        path = self.dest()
+        download_direct(self.details(), path, 0, 60, attempts=3,
+                        client_factory=self.factory(handler), sleep=lambda _: None)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), self.PAYLOAD, "服务器不认 Range 时必须从头重下，不能把整份追加到半截后面")
+
+    def test_gives_up_with_progress_after_all_attempts(self):
+        def handler(request):
+            return httpx.Response(200, content=self.dropping_stream(self.PAYLOAD, 1000))
+
+        with self.assertRaises(WorkshopError) as ctx:
+            download_direct(self.details(), self.dest(), 0, 60, attempts=3,
+                            client_factory=self.factory(handler), sleep=lambda _: None)
+        message = str(ctx.exception)
+        self.assertIn("试了 3 次", message)
+        self.assertIn("peer closed connection", message)
+
+    def test_client_errors_are_not_retried(self):
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            return httpx.Response(404)
+
+        with self.assertRaises(WorkshopError) as ctx:
+            download_direct(self.details(), self.dest(), 0, 60, attempts=5,
+                            client_factory=self.factory(handler), sleep=lambda _: None)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("HTTP 404", str(ctx.exception))
+
+    def test_size_limit_is_not_retried(self):
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            return httpx.Response(200, content=self.PAYLOAD)
+
+        with self.assertRaises(WorkshopError) as ctx:
+            download_direct(self.details(), self.dest(), 1024, 60, attempts=5,
+                            client_factory=self.factory(handler), sleep=lambda _: None)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("文件过大", str(ctx.exception))
+
+    def test_redirect_outside_steam_hosts_is_refused(self):
+        def handler(request):
+            if request.url.host == "cdn.steamusercontent.com":
+                return httpx.Response(302, headers={"location": "https://evil.example.com/x"})
+            return httpx.Response(200, content=self.PAYLOAD)
+
+        with self.assertRaises(WorkshopError) as ctx:
+            download_direct(self.details(), self.dest(), 0, 60, attempts=2,
+                            client_factory=self.factory(handler), sleep=lambda _: None)
+        self.assertIn("跳转", str(ctx.exception))
+
+
+class LegacyBinCollectTest(unittest.TestCase):
+    def test_vpk_without_vpk_extension_is_collected_by_magic(self):
+        root = tempfile.mkdtemp(prefix="workshop-legacy-")
+        self.addCleanup(shutil.rmtree, root, True)
+        with open(os.path.join(root, "3106061469_legacy.bin"), "wb") as handle:
+            handle.write(b"\x34\x12\xaa\x55" + b"x" * 16)
+        with open(os.path.join(root, "notes.bin"), "wb") as handle:
+            handle.write(b"not a vpk")
+        found = [os.path.basename(path) for path in collect_vpk_files(root)]
+        self.assertEqual(found, ["3106061469_legacy.bin"])
+
+    def test_describe_files_lists_what_was_downloaded(self):
+        root = tempfile.mkdtemp(prefix="workshop-describe-")
+        self.addCleanup(shutil.rmtree, root, True)
+        self.assertEqual(describe_files(root), "目录是空的")
+        with open(os.path.join(root, "a.bin"), "wb") as handle:
+            handle.write(b"x")
+        self.assertEqual(describe_files(root), "a.bin")
 
 
 if __name__ == "__main__":

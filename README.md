@@ -184,7 +184,7 @@ curl -X POST https://node.example.com/api/federation/workshop \
 
 ### 两条下载通道
 
-1. **直链**：`file_url` 来自上游带来的 `details`，或者节点自己查 Steam Web API。直接 HTTPS 取回，不需要 steamcmd，arm64 节点也能用。物品内容托管在 SteamPipe 上时 Steam 返回的 `file_url` 会退化成预览图地址，节点会识别出来并跳过这条通道。
+1. **直链**：`file_url` 来自上游带来的 `details`，或者节点自己查 Steam Web API。直接 HTTPS 取回，不需要 steamcmd，arm64 节点也能用。物品内容托管在 SteamPipe 上时 Steam 返回的 `file_url` 会退化成预览图地址，节点会识别出来并跳过这条通道。国内节点连 Steam CDN 常被中途断开（实测 827 MB 的图在 99 MB 处断过），所以直链下载**断了会用 Range 从断点接着下**，最多 `STEAM_WORKSHOP_DIRECT_ATTEMPTS` 次（缺省 8），总时长不超过 `STEAM_WORKSHOP_TIMEOUT_SECONDS`；单次读取 60 秒没有数据就算断开。直链最终失败、又没法改用 steamcmd 时，报错里同时写出两边的原因，不会只剩 steamcmd 那一句。
 2. **steamcmd**：以匿名身份执行 `workshop_download_item`，覆盖直链拿不到的物品。**注意它依赖 `client-download.steampowered.com` 做自更新，实测三台生产节点全都解析不了这个域名，所以国内机房基本只能靠直链通道。** 节点会探测这个域名能不能连上（见下文 `steamcmd_ready`），连不上时走 steamcmd 的物品直接失败，不再白白重试三轮。
 
 ### steamcmd 的两个前提
@@ -193,6 +193,8 @@ curl -X POST https://node.example.com/api/federation/workshop \
 - **需要能访问 `client-download.steampowered.com`**。steamcmd 每次启动都会自更新，这个域名解析不了就会静默退出。节点会把它自己的 `bootstrap_log.txt` 里的失败行拼进错误信息，例如 `steamcmd 退出码 1（Download failed: http error 0 (client-download.steampowered.com/client/steam_cmd_linux)）`，方便直接定位是网络问题。国内机器构建镜像时还可以用 `--build-arg STEAMCMD_URL=<镜像地址>` 换掉 steamcmd 安装包的下载源。
 
 节点启动时和之后每隔 `STEAMCMD_PROBE_TTL_SECONDS`（默认 600 秒）会在后台探测一次 `STEAMCMD_UPDATE_HOST`（默认 `client-download.steampowered.com`）的 443/80 端口，结果放在 `site.workshop.steamcmd_ready`，失败原因在 `steamcmd_error`。`steamcmd_available` 只表示镜像里带了 steamcmd，**上游判断能不能走 steamcmd 应该看 `steamcmd_ready`**。steamcmd 实际运行时因为自更新失败退出，也会立刻把 `steamcmd_ready` 置为 false。
+
+steamcmd 取回的老式物品文件名不一定是 `.vpk`（例如 `*_legacy.bin`），节点会按 VPK 文件头把它认出来；一个都认不出时，报错里会列出实际下载到的文件。
 
 首次调用会把镜像里的 steamcmd 复制到 `/app/data/steamcmd` 再运行，自更新和下载缓存都留在数据卷里，容器重建不用重下。任务串行执行（steamcmd 不支持并发使用同一个安装目录），未完成任务超过 `STEAM_WORKSHOP_MAX_QUEUED_JOBS` 时接口返回 `429`。节点重启会把队列里和执行中的任务标记为 `failed`，需要 NewAnneWeb 重新触发。
 
@@ -206,6 +208,7 @@ STEAM_WORKSHOP_MAX_QUEUED_JOBS=32
 STEAM_WORKSHOP_DIRECT_DOWNLOAD=1
 STEAM_WORKSHOP_ENFORCE_APPID=1
 STEAM_WORKSHOP_JOB_RETENTION_HOURS=72
+STEAM_WORKSHOP_DIRECT_ATTEMPTS=8
 STEAMCMD_UPDATE_HOST=client-download.steampowered.com
 STEAMCMD_PROBE_TTL_SECONDS=600
 STEAMCMD_PROBE_TIMEOUT_SECONDS=5

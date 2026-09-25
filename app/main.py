@@ -41,6 +41,7 @@ from .steam_workshop import (
     WorkshopError,
     WorkshopItemDetails,
     collect_vpk_files,
+    describe_files,
     details_from_payload,
     download_direct,
     looks_like_vpk,
@@ -2520,25 +2521,44 @@ def _workshop_stage_downloads(
                 )
 
     # 旧版 UGC 带真正的 file_url，直接 HTTPS 取回比拉一次 steamcmd 快得多。
+    direct_error: Optional[str] = None
     if details is not None and details.has_legacy_vpk and WORKSHOP.direct_download_enabled:
         dest = os.path.join(TMP_DIR, f"workshop_{workshop_id}_{secrets.token_hex(4)}.vpk")
         try:
-            download_direct(details, dest, max_bytes, WORKSHOP.download_timeout_seconds)
+            download_direct(
+                details,
+                dest,
+                max_bytes,
+                WORKSHOP.download_timeout_seconds,
+                attempts=WORKSHOP.direct_download_attempts,
+            )
             if not looks_like_vpk(dest):
                 raise WorkshopError("创意工坊直链返回的不是 VPK 文件")
             return [dest], "direct"
         except WorkshopError as exc:
             _remove_file_quietly(dest)
-            if not WORKSHOP_STEAMCMD.available:
-                raise
+            direct_error = str(exc)
             logger.warning("workshop direct download failed item=%s error=%s", workshop_id, exc)
+            # steamcmd 用不了就别拿它的报错盖掉直链失败的真实原因。
+            ready, reason = WORKSHOP_STEAMCMD.readiness(block=True)
+            if not ready:
+                raise WorkshopError(f"{direct_error}；节点的 steamcmd 也不可用：{reason}") from exc
 
-    content_dir = WORKSHOP_STEAMCMD.download(workshop_id)
+    try:
+        content_dir = WORKSHOP_STEAMCMD.download(workshop_id)
+    except WorkshopError as exc:
+        if direct_error is not None:
+            raise WorkshopError(f"{direct_error}；改用 steamcmd 也失败了：{exc}") from exc
+        if details is None:
+            raise WorkshopError(f"节点没拿到这个物品的 Steam 信息（连不上 Steam Web API），只能用 steamcmd：{exc}") from exc
+        if not details.has_legacy_vpk:
+            raise WorkshopError(f"这个物品没有可直接下载的文件，只能用 steamcmd：{exc}") from exc
+        raise
     staged: list[str] = []
     try:
         sources = collect_vpk_files(content_dir)
         if not sources:
-            raise WorkshopError("创意工坊物品里没有 .vpk 文件")
+            raise WorkshopError(f"创意工坊物品里没有 VPK 文件（下载到的是：{describe_files(content_dir)}）")
         for source_path in sources:
             size = os.path.getsize(source_path)
             if size > max_bytes:

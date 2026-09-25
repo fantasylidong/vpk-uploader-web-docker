@@ -104,6 +104,7 @@ class WorkshopConfig:
     steamcmd_update_host: str = STEAMCMD_UPDATE_HOST
     steamcmd_probe_ttl_seconds: int = 600
     steamcmd_probe_timeout_seconds: int = 5
+    direct_download_attempts: int = 8
 
     @property
     def steamcmd_script(self) -> str:
@@ -143,6 +144,7 @@ def load_workshop_config(env: Optional[Mapping[str, str]] = None) -> WorkshopCon
         steamcmd_update_host=(env.get("STEAMCMD_UPDATE_HOST") or STEAMCMD_UPDATE_HOST).strip(),
         steamcmd_probe_ttl_seconds=_env_int(env, "STEAMCMD_PROBE_TTL_SECONDS", 600, 30, 86400),
         steamcmd_probe_timeout_seconds=_env_int(env, "STEAMCMD_PROBE_TIMEOUT_SECONDS", 5, 1, 30),
+        direct_download_attempts=_env_int(env, "STEAM_WORKSHOP_DIRECT_ATTEMPTS", 8, 1, 30),
     )
 
 
@@ -575,24 +577,85 @@ def _steamcmd_error(output: str, return_code: int) -> str:
     return f"steamcmd 退出码 {return_code}"
 
 
-def download_direct(details: WorkshopItemDetails, dest_path: str, max_bytes: int, timeout_seconds: int) -> int:
-    """旧版 UGC 的 file_url 可以直接 HTTPS 取回，省掉一次 steamcmd 调用。"""
+def _format_mb(byte_count: int) -> str:
+    return f"{byte_count / 1024 / 1024:.1f} MB"
+
+
+def download_direct(
+    details: WorkshopItemDetails,
+    dest_path: str,
+    max_bytes: int,
+    timeout_seconds: int,
+    attempts: int = 8,
+    client_factory=None,
+    sleep=time.sleep,
+) -> int:
+    """旧版 UGC 的 file_url 可以直接 HTTPS 取回，省掉一次 steamcmd 调用。
+
+    国内节点连 Steam CDN 常常下到一半被断开（实测 827 MB 的图在 99 MB 处断过），
+    所以断了就用 Range 从已下载的位置接着下，最多 attempts 次，总共不超过 timeout_seconds。
+    """
     if not direct_download_host_allowed(details.file_url):
         raise WorkshopError("创意工坊直链地址不在允许的 Steam 下载域内")
+    # file_size 只有老式 UGC 才是 VPK 的真实大小，用来判断是不是下完了。
+    expected = details.file_size if details.has_legacy_vpk and details.file_size > 0 else 0
+    factory = client_factory or (
+        lambda: httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0), follow_redirects=True)
+    )
+    deadline = time.monotonic() + timeout_seconds
     written = 0
-    try:
-        with httpx.Client(timeout=timeout_seconds, follow_redirects=True) as client, \
-                client.stream("GET", details.file_url) as response:
-            response.raise_for_status()
-            with open(dest_path, "wb") as out:
-                for chunk in response.iter_bytes(1024 * 1024):
-                    written += len(chunk)
-                    if max_bytes and written > max_bytes:
-                        raise WorkshopError(f"文件过大，超过 {max_bytes // 1024 // 1024} MB 限制")
-                    out.write(chunk)
-    except httpx.HTTPError as exc:
-        raise WorkshopError(f"创意工坊直链下载失败：{exc}") from exc
-    return written
+    last_error = ""
+    open(dest_path, "wb").close()
+
+    for attempt in range(1, max(1, attempts) + 1):
+        headers = {"Range": f"bytes={written}-"} if written else {}
+        try:
+            with factory() as client, client.stream("GET", details.file_url, headers=headers) as response:
+                if not direct_download_host_allowed(str(response.url)):
+                    raise WorkshopError("创意工坊直链被跳转到了 Steam 下载域以外的地址")
+                if written and response.status_code == 416 and expected and written >= expected:
+                    return written
+                response.raise_for_status()
+                resumed = written > 0 and response.status_code == 206 and \
+                    str(response.headers.get("content-range", "")).startswith(f"bytes {written}-")
+                if not resumed:
+                    # 服务器不认 Range（或者第一次下载）：从头来。
+                    written = 0
+                with open(dest_path, "ab" if resumed else "wb") as out:
+                    # 不指定块大小：收到多少写多少，断线时已收到的字节都已落盘，续传位置才准。
+                    for chunk in response.iter_bytes():
+                        if max_bytes and written + len(chunk) > max_bytes:
+                            raise WorkshopError(f"文件过大，超过 {max_bytes // 1024 // 1024} MB 限制")
+                        out.write(chunk)
+                        written += len(chunk)
+                        if time.monotonic() > deadline:
+                            raise WorkshopError(
+                                f"创意工坊直链下载超时（{timeout_seconds} 秒内只下到 {_format_mb(written)}）"
+                            )
+            if not expected or written >= expected:
+                return written
+            last_error = f"连接提前结束（{_format_mb(written)} / {_format_mb(expected)}）"
+        except WorkshopError:
+            raise
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            last_error = f"HTTP {status}"
+            # 4xx（限流和超时除外）重试也没用。
+            if 400 <= status < 500 and status not in (408, 429):
+                break
+        except httpx.HTTPError as exc:
+            last_error = str(exc) or exc.__class__.__name__
+
+        if attempt >= attempts or time.monotonic() > deadline:
+            break
+        logger.warning(
+            "workshop direct download interrupted item=%s attempt=%s/%s received=%s error=%s",
+            details.published_file_id, attempt, attempts, written, last_error,
+        )
+        sleep(min(10, 2 * attempt))
+
+    progress = f"，已下载 {_format_mb(written)}" + (f" / {_format_mb(expected)}" if expected else "")
+    raise WorkshopError(f"创意工坊直链下载失败（试了 {attempt} 次{progress}）：{last_error}")
 
 
 def looks_like_vpk(path: str) -> bool:
@@ -605,11 +668,29 @@ def looks_like_vpk(path: str) -> bool:
 
 
 def collect_vpk_files(content_dir: str) -> list[str]:
-    """创意工坊物品目录里可能带说明文件，只取 .vpk。"""
+    """取出物品目录里的 VPK。
+
+    目录里可能带说明文件；老式 UGC 用 steamcmd 取回时文件名不一定是 .vpk（比如 *_legacy.bin），
+    所以扩展名不对的再按 VPK 文件头认一遍。
+    """
     found: list[str] = []
     for root, _, files in os.walk(content_dir):
         for name in files:
-            if name.lower().endswith(".vpk"):
-                found.append(os.path.join(root, name))
+            path = os.path.join(root, name)
+            if name.lower().endswith(".vpk") or looks_like_vpk(path):
+                found.append(path)
     found.sort()
     return found
+
+
+def describe_files(content_dir: str, limit: int = 5) -> str:
+    """失败时告诉调用方下载到了什么，方便判断是不是物品本身就不是地图包。"""
+    names: list[str] = []
+    for root, _, files in os.walk(content_dir):
+        for name in files:
+            names.append(os.path.relpath(os.path.join(root, name), content_dir))
+    names.sort()
+    if not names:
+        return "目录是空的"
+    shown = "、".join(names[:limit])
+    return shown + (f" 等 {len(names)} 个文件" if len(names) > limit else "")

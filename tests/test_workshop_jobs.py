@@ -314,7 +314,7 @@ class StageDownloadGuardTest(WorkshopJobTestCase):
             file_size=1024,
         )
 
-        def fake_direct(item_details, dest_path, max_bytes, timeout_seconds):
+        def fake_direct(item_details, dest_path, max_bytes, timeout_seconds, **kwargs):
             with open(dest_path, "wb") as out:
                 out.write(b"\x89PNG\r\n\x1a\n")
             return 8
@@ -325,6 +325,7 @@ class StageDownloadGuardTest(WorkshopJobTestCase):
         make_vpk(os.path.join(content_dir, f"{ITEM_ID}.vpk"))
 
         with patch.object(main.SteamCmdRunner, "available", True), \
+             patch.object(main.WORKSHOP_STEAMCMD, "readiness", return_value=(True, "")), \
              patch.object(main, "download_direct", side_effect=fake_direct), \
              patch.object(main.WORKSHOP_STEAMCMD, "download", return_value=content_dir), \
              patch.object(main.WORKSHOP_STEAMCMD, "cleanup"):
@@ -333,6 +334,49 @@ class StageDownloadGuardTest(WorkshopJobTestCase):
         self.addCleanup(main._remove_file_quietly, staged[0])
         self.assertEqual(source, "steamcmd")
         self.assertEqual(len(staged), 1)
+
+    def legacy_details(self):
+        return details_for(
+            ITEM_ID,
+            filename="map.vpk",
+            file_url="https://cdn.steamusercontent.com/ugc/1/A/",
+            preview_url="https://images.steamusercontent.com/ugc/2/B/",
+            file_size=1024,
+        )
+
+    def test_direct_failure_is_not_hidden_behind_an_unusable_steamcmd(self):
+        # 线上实测：直链下到一半断开，再退到连不上更新服务器的 steamcmd，玩家只看到了 steamcmd 的报错。
+        broken = WorkshopError("创意工坊直链下载失败（试了 8 次，已下载 99.3 MB / 827.0 MB）：peer closed connection")
+        with patch.object(main, "download_direct", side_effect=broken), \
+             patch.object(main.WORKSHOP_STEAMCMD, "readiness", return_value=(False, "无法解析 client-download.steampowered.com")), \
+             patch.object(main.WORKSHOP_STEAMCMD, "download") as steamcmd, \
+             self.assertRaises(WorkshopError) as ctx:
+            main._workshop_stage_downloads(ITEM_ID, self.legacy_details(), 1024)
+        steamcmd.assert_not_called()
+        message = str(ctx.exception)
+        self.assertIn("peer closed connection", message)
+        self.assertIn("steamcmd 也不可用", message)
+
+    def test_both_failures_are_reported_when_steamcmd_also_fails(self):
+        with patch.object(main, "download_direct", side_effect=WorkshopError("直链断开")), \
+             patch.object(main.WORKSHOP_STEAMCMD, "readiness", return_value=(True, "")), \
+             patch.object(main.WORKSHOP_STEAMCMD, "download", side_effect=WorkshopError("steamcmd 下载超时")), \
+             self.assertRaises(WorkshopError) as ctx:
+            main._workshop_stage_downloads(ITEM_ID, self.legacy_details(), 1024)
+        self.assertIn("直链断开", str(ctx.exception))
+        self.assertIn("steamcmd 下载超时", str(ctx.exception))
+
+    def test_missing_vpk_error_lists_downloaded_files(self):
+        content_dir = os.path.join(main.TMP_DIR, "fake-content-empty")
+        os.makedirs(content_dir, exist_ok=True)
+        self.addCleanup(shutil.rmtree, content_dir, True)
+        with open(os.path.join(content_dir, "readme.txt"), "w", encoding="utf-8") as handle:
+            handle.write("hi")
+        with patch.object(main.WORKSHOP_STEAMCMD, "download", return_value=content_dir), \
+             patch.object(main.WORKSHOP_STEAMCMD, "cleanup"), \
+             self.assertRaises(WorkshopError) as ctx:
+            main._workshop_stage_downloads(ITEM_ID, None, 1024)
+        self.assertIn("readme.txt", str(ctx.exception))
 
     def test_capacity_shortage_is_rejected_before_download(self):
         details = details_for(
