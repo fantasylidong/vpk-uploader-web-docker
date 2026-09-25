@@ -1,6 +1,7 @@
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 
 from unittest.mock import patch
@@ -18,6 +19,7 @@ from app.steam_workshop import (  # noqa: E402
     describe_files,
     details_from_payload,
     direct_download_host_allowed,
+    direct_download_urls,
     download_direct,
     load_workshop_config,
     looks_like_vpk,
@@ -509,10 +511,26 @@ class DirectDownloadResumeTest(unittest.TestCase):
             return httpx.Response(404)
 
         with self.assertRaises(WorkshopError) as ctx:
-            download_direct(self.details(), self.dest(), 0, 60, attempts=5,
+            download_direct(self.details(), self.dest(), 0, 60, attempts=5, mirrors=(),
                             client_factory=self.factory(handler), sleep=lambda _: None)
         self.assertEqual(len(calls), 1)
         self.assertIn("HTTP 404", str(ctx.exception))
+
+    def test_client_error_on_one_host_tries_the_mirror(self):
+        hosts = []
+
+        def handler(request):
+            hosts.append(request.url.host)
+            if request.url.host == "cdn.steamusercontent.com":
+                return httpx.Response(403)
+            return httpx.Response(200, content=self.PAYLOAD)
+
+        path = self.dest()
+        download_direct(self.details(), path, 0, 60, attempts=5,
+                        client_factory=self.factory(handler), sleep=lambda _: None)
+        self.assertEqual(hosts, ["cdn.steamusercontent.com", "steamusercontent-a.akamaihd.net"])
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), self.PAYLOAD)
 
     def test_size_limit_is_not_retried(self):
         calls = []
@@ -524,8 +542,13 @@ class DirectDownloadResumeTest(unittest.TestCase):
         with self.assertRaises(WorkshopError) as ctx:
             download_direct(self.details(), self.dest(), 1024, 60, attempts=5,
                             client_factory=self.factory(handler), sleep=lambda _: None)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 0, "Steam 报的大小已经超限，一个字节都不该下")
         self.assertIn("文件过大", str(ctx.exception))
+
+        with self.assertRaises(WorkshopError):
+            download_direct(self.details(size=0), self.dest(), 1024, 60, attempts=5,
+                            client_factory=self.factory(handler), sleep=lambda _: None)
+        self.assertEqual(len(calls), 1, "不知道大小时边下边判，超限就停且不重试")
 
     def test_redirect_outside_steam_hosts_is_refused(self):
         def handler(request):
@@ -557,6 +580,114 @@ class LegacyBinCollectTest(unittest.TestCase):
         with open(os.path.join(root, "a.bin"), "wb") as handle:
             handle.write(b"x")
         self.assertEqual(describe_files(root), "a.bin")
+
+
+class SegmentedDownloadTest(unittest.TestCase):
+    """国内节点连 Steam CDN 单连接被限速：切段多路并行，原域名和镜像域名轮着用。"""
+
+    URL = "https://cdn.steamusercontent.com/ugc/1/ABC/"
+    PAYLOAD = b"\x34\x12\xaa\x55" + bytes(range(256)) * 40  # 10244 字节，1 KB 一段 → 11 段
+
+    def details(self):
+        return WorkshopItemDetails(
+            published_file_id="2396847377", title="广州增城", file_size=len(self.PAYLOAD),
+            consumer_app_id=550, filename="zc806.vpk", file_url=self.URL,
+            banned=False, ban_reason="", preview_url="https://images.steamusercontent.com/ugc/2/B/",
+        )
+
+    def dest(self):
+        handle, path = tempfile.mkstemp(suffix=".vpk")
+        os.close(handle)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        return path
+
+    def ranged(self, request):
+        spec = request.headers["range"].split("=")[1]
+        start, _, end = spec.partition("-")
+        start = int(start)
+        end = int(end) if end else len(self.PAYLOAD) - 1
+        return start, end, httpx.Response(
+            206,
+            headers={"content-range": f"bytes {start}-{end}/{len(self.PAYLOAD)}"},
+            content=self.PAYLOAD[start:end + 1],
+        )
+
+    def run_download(self, handler, **kwargs):
+        path = self.dest()
+        options = {"attempts": 4, "connections": 3, "piece_bytes": 1024, "sleep": lambda _: None}
+        options.update(kwargs)
+        written = download_direct(
+            self.details(), path, 0, 60,
+            client_factory=lambda: httpx.Client(transport=httpx.MockTransport(handler), timeout=5),
+            **options,
+        )
+        with open(path, "rb") as handle:
+            return written, handle.read()
+
+    def test_pieces_are_fetched_in_parallel_across_both_hosts(self):
+        hosts = set()
+        lock = threading.Lock()
+
+        def handler(request):
+            with lock:
+                hosts.add(request.url.host)
+            return self.ranged(request)[2]
+
+        written, data = self.run_download(handler)
+        self.assertEqual(written, len(self.PAYLOAD))
+        self.assertEqual(data, self.PAYLOAD)
+        self.assertEqual(hosts, {"cdn.steamusercontent.com", "steamusercontent-a.akamaihd.net"})
+
+    def test_a_dropped_piece_resumes_where_it_stopped(self):
+        dropped = []
+        lock = threading.Lock()
+
+        def handler(request):
+            start, end, response = self.ranged(request)
+            with lock:
+                first = start == 2048 and not dropped
+                if first:
+                    dropped.append(request.headers["range"])
+            if first:
+                def generate():
+                    yield self.PAYLOAD[start:start + 300]
+                    raise httpx.RemoteProtocolError("peer closed connection")
+                return httpx.Response(206, headers={"content-range": f"bytes {start}-{end}/{len(self.PAYLOAD)}"},
+                                      content=generate())
+            return response
+
+        _, data = self.run_download(handler)
+        self.assertEqual(dropped, ["bytes=2048-3071"])
+        self.assertEqual(data, self.PAYLOAD)
+
+    def test_mirror_refusing_the_file_falls_back_to_the_original_host(self):
+        def handler(request):
+            if request.url.host != "cdn.steamusercontent.com":
+                return httpx.Response(403)
+            return self.ranged(request)[2]
+
+        _, data = self.run_download(handler)
+        self.assertEqual(data, self.PAYLOAD)
+
+    def test_server_without_range_support_falls_back_to_one_stream(self):
+        def handler(request):
+            return httpx.Response(200, content=self.PAYLOAD)
+
+        _, data = self.run_download(handler)
+        self.assertEqual(data, self.PAYLOAD)
+
+    def test_mirror_urls_keep_the_ugc_path(self):
+        self.assertEqual(
+            direct_download_urls(self.URL),
+            [self.URL, "https://steamusercontent-a.akamaihd.net/ugc/1/ABC/"],
+        )
+        self.assertEqual(direct_download_urls(self.URL, mirrors=()), [self.URL])
+        self.assertEqual(
+            direct_download_urls("https://cdn.steamusercontent.com/other/x"),
+            ["https://cdn.steamusercontent.com/other/x"],
+            "只有 /ugc/ 路径在各域名上一致",
+        )
+        self.assertEqual(direct_download_urls(self.URL, mirrors=("evil.example.com",)), [self.URL])
 
 
 if __name__ == "__main__":

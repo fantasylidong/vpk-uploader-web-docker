@@ -184,7 +184,7 @@ curl -X POST https://node.example.com/api/federation/workshop \
 
 ### 两条下载通道
 
-1. **直链**：`file_url` 来自上游带来的 `details`，或者节点自己查 Steam Web API。直接 HTTPS 取回，不需要 steamcmd，arm64 节点也能用。物品内容托管在 SteamPipe 上时 Steam 返回的 `file_url` 会退化成预览图地址，节点会识别出来并跳过这条通道。国内节点连 Steam CDN 常被中途断开（实测 827 MB 的图在 99 MB 处断过），所以直链下载**断了会用 Range 从断点接着下**，最多 `STEAM_WORKSHOP_DIRECT_ATTEMPTS` 次（缺省 8），总时长不超过 `STEAM_WORKSHOP_TIMEOUT_SECONDS`；单次读取 60 秒没有数据就算断开。直链最终失败、又没法改用 steamcmd 时，报错里同时写出两边的原因，不会只剩 steamcmd 那一句。
+1. **直链**：`file_url` 来自上游带来的 `details`，或者节点自己查 Steam Web API。直接 HTTPS 取回，不需要 steamcmd，arm64 节点也能用。物品内容托管在 SteamPipe 上时 Steam 返回的 `file_url` 会退化成预览图地址，节点会识别出来并跳过这条通道。国内节点连 Steam CDN **单连接会被限速、还常被中途断开**（#58-59 实测 `cdn.steamusercontent.com` 单连接 35～300 KB/s，827 MB 的图在 99 MB 处断过；同一文件 8 路并行能到 6 MB/s，Akamai 老域名 `steamusercontent-a.akamaihd.net` 单连接约 2 MB/s）。所以知道文件大小时，直链下载**切成 16 MB 一段、`STEAM_WORKSHOP_DIRECT_CONNECTIONS` 路并行**（缺省 4），每段在原域名和 `STEAM_WORKSHOP_DIRECT_MIRRORS`（缺省 `steamusercontent-a.akamaihd.net`，逗号分隔，留空只用原域名）之间轮换；某个域名对这份文件返回 4xx 就只用其它域名。每段断了用 Range 从断点接着下，最多 `STEAM_WORKSHOP_DIRECT_ATTEMPTS` 次（缺省 8）；服务器不认 Range 时退回单连接下载。总时长不超过 `STEAM_WORKSHOP_TIMEOUT_SECONDS`，单次读取 60 秒没有数据就算断开。镜像域名也必须在 Steam 下载域白名单里，跳转出白名单一律拒绝。直链最终失败、又没法改用 steamcmd 时，报错里同时写出两边的原因，不会只剩 steamcmd 那一句。
 2. **steamcmd**：以匿名身份执行 `workshop_download_item`，覆盖直链拿不到的物品。**注意它依赖 `client-download.steampowered.com` 做自更新，实测三台生产节点全都解析不了这个域名，所以国内机房基本只能靠直链通道。** 节点会探测这个域名能不能连上（见下文 `steamcmd_ready`），连不上时走 steamcmd 的物品直接失败，不再白白重试三轮。
 
 ### steamcmd 的两个前提
@@ -209,6 +209,8 @@ STEAM_WORKSHOP_DIRECT_DOWNLOAD=1
 STEAM_WORKSHOP_ENFORCE_APPID=1
 STEAM_WORKSHOP_JOB_RETENTION_HOURS=72
 STEAM_WORKSHOP_DIRECT_ATTEMPTS=8
+STEAM_WORKSHOP_DIRECT_CONNECTIONS=4
+STEAM_WORKSHOP_DIRECT_MIRRORS=steamusercontent-a.akamaihd.net
 STEAMCMD_UPDATE_HOST=client-download.steampowered.com
 STEAMCMD_PROBE_TTL_SECONDS=600
 STEAMCMD_PROBE_TIMEOUT_SECONDS=5

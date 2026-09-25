@@ -15,7 +15,8 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
-from urllib.parse import parse_qs, urlsplit
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import httpx
 
@@ -37,6 +38,10 @@ COLLECTION_FILETYPE = 2
 MAX_COLLECTION_DEPTH = 3
 MAX_ITEMS_PER_JOB = 200
 TRUE_VALUES = {"1", "true", "yes", "on"}
+# 同一份 UGC 文件在这些域名上路径相同。国内节点连 cdn.steamusercontent.com 单连接常被限到几百 KB/s，
+# Akamai 这个老域名实测快好几倍，所以分段下载时两边一起用。
+DEFAULT_DIRECT_MIRRORS = ("steamusercontent-a.akamaihd.net",)
+DIRECT_PIECE_BYTES = 16 * 1024 * 1024
 # steamcmd 每次启动都先找这个域名自更新，连不上就静默退出。
 STEAMCMD_UPDATE_HOST = "client-download.steampowered.com"
 STEAMCMD_PROBE_PORTS = (443, 80)
@@ -105,6 +110,8 @@ class WorkshopConfig:
     steamcmd_probe_ttl_seconds: int = 600
     steamcmd_probe_timeout_seconds: int = 5
     direct_download_attempts: int = 8
+    direct_download_connections: int = 4
+    direct_download_mirrors: tuple[str, ...] = DEFAULT_DIRECT_MIRRORS
 
     @property
     def steamcmd_script(self) -> str:
@@ -145,6 +152,12 @@ def load_workshop_config(env: Optional[Mapping[str, str]] = None) -> WorkshopCon
         steamcmd_probe_ttl_seconds=_env_int(env, "STEAMCMD_PROBE_TTL_SECONDS", 600, 30, 86400),
         steamcmd_probe_timeout_seconds=_env_int(env, "STEAMCMD_PROBE_TIMEOUT_SECONDS", 5, 1, 30),
         direct_download_attempts=_env_int(env, "STEAM_WORKSHOP_DIRECT_ATTEMPTS", 8, 1, 30),
+        direct_download_connections=_env_int(env, "STEAM_WORKSHOP_DIRECT_CONNECTIONS", 4, 1, 16),
+        direct_download_mirrors=tuple(
+            host.strip().lower()
+            for host in str(env.get("STEAM_WORKSHOP_DIRECT_MIRRORS", ",".join(DEFAULT_DIRECT_MIRRORS))).split(",")
+            if host.strip()
+        ),
     )
 
 
@@ -581,6 +594,30 @@ def _format_mb(byte_count: int) -> str:
     return f"{byte_count / 1024 / 1024:.1f} MB"
 
 
+class _RangeUnsupported(Exception):
+    """服务器不认 Range，只能单连接从头下。"""
+
+
+def direct_download_urls(file_url: str, mirrors=DEFAULT_DIRECT_MIRRORS) -> list[str]:
+    """原直链加上同一路径的镜像域名（都得在 Steam 下载域白名单里）。"""
+    parsed = urlsplit(file_url)
+    urls = [file_url]
+    if not parsed.path.startswith("/ugc/"):
+        return urls
+    for host in mirrors:
+        host = (host or "").strip().lower()
+        if not host or host == (parsed.hostname or "").lower():
+            continue
+        candidate = urlunsplit(("https", host, parsed.path, parsed.query, ""))
+        if direct_download_host_allowed(candidate) and candidate not in urls:
+            urls.append(candidate)
+    return urls
+
+
+def _is_permanent_http_error(status: int) -> bool:
+    return 400 <= status < 500 and status not in (408, 429)
+
+
 def download_direct(
     details: WorkshopItemDetails,
     dest_path: str,
@@ -589,28 +626,167 @@ def download_direct(
     attempts: int = 8,
     client_factory=None,
     sleep=time.sleep,
+    connections: int = 4,
+    mirrors=DEFAULT_DIRECT_MIRRORS,
+    piece_bytes: int = DIRECT_PIECE_BYTES,
 ) -> int:
     """旧版 UGC 的 file_url 可以直接 HTTPS 取回，省掉一次 steamcmd 调用。
 
-    国内节点连 Steam CDN 常常下到一半被断开（实测 827 MB 的图在 99 MB 处断过），
-    所以断了就用 Range 从已下载的位置接着下，最多 attempts 次，总共不超过 timeout_seconds。
+    国内节点连 Steam CDN 单连接常被限速、下到一半还会被断开（#58-59 实测 30 分钟只下了 63 MB），
+    所以知道文件大小时切成若干段，多路并行、原域名和镜像域名轮着用，每段断了就从断点接着下；
+    服务器不认 Range 时退回单连接下载。总共不超过 timeout_seconds。
     """
     if not direct_download_host_allowed(details.file_url):
         raise WorkshopError("创意工坊直链地址不在允许的 Steam 下载域内")
-    # file_size 只有老式 UGC 才是 VPK 的真实大小，用来判断是不是下完了。
+    # file_size 只有老式 UGC 才是 VPK 的真实大小，用来分段和判断是不是下完了。
     expected = details.file_size if details.has_legacy_vpk and details.file_size > 0 else 0
+    if max_bytes and expected > max_bytes:
+        raise WorkshopError(f"文件过大，超过 {max_bytes // 1024 // 1024} MB 限制")
     factory = client_factory or (
         lambda: httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0), follow_redirects=True)
     )
+    urls = direct_download_urls(details.file_url, mirrors)
     deadline = time.monotonic() + timeout_seconds
+    attempts = max(1, attempts)
+
+    if expected and connections > 1 and expected > piece_bytes:
+        try:
+            return _download_segmented(
+                details, urls, dest_path, expected, deadline, timeout_seconds,
+                attempts, factory, sleep, connections, piece_bytes,
+            )
+        except _RangeUnsupported:
+            logger.info("workshop direct download: range unsupported, falling back to one stream item=%s",
+                        details.published_file_id)
+    return _download_single(details, urls, dest_path, max_bytes, expected, deadline, timeout_seconds,
+                            attempts, factory, sleep)
+
+
+def _download_segmented(details, urls, dest_path, expected, deadline, timeout_seconds,
+                        attempts, factory, sleep, connections, piece_bytes) -> int:
+    pieces = [(start, min(start + piece_bytes, expected) - 1) for start in range(0, expected, piece_bytes)]
+    lock = threading.Lock()
+    stop = threading.Event()
+    bad_urls: set[str] = set()
+    next_piece = [0]
+    received = [0]
+
+    with open(dest_path, "wb") as out:
+        out.truncate(expected)
+
+    def pick_url(index: int, attempt: int) -> str:
+        with lock:
+            usable = [url for url in urls if url not in bad_urls] or list(urls)
+        return usable[(index + attempt) % len(usable)]
+
+    def fetch_piece(client, out, index: int, start: int, end: int) -> None:
+        pos = start
+        attempt = 0
+        last_error = ""
+        while pos <= end:
+            if stop.is_set():
+                return
+            if time.monotonic() > deadline:
+                raise WorkshopError(
+                    f"创意工坊直链下载超时（{timeout_seconds} 秒内只下到 {_format_mb(received[0])} / {_format_mb(expected)}）"
+                )
+            url = pick_url(index, attempt)
+            try:
+                with client.stream("GET", url, headers={"Range": f"bytes={pos}-{end}"}) as response:
+                    if not direct_download_host_allowed(str(response.url)):
+                        raise WorkshopError("创意工坊直链被跳转到了 Steam 下载域以外的地址")
+                    if response.status_code == 200:
+                        raise _RangeUnsupported()
+                    response.raise_for_status()
+                    if not str(response.headers.get("content-range", "")).startswith(f"bytes {pos}-"):
+                        raise _RangeUnsupported()
+                    out.seek(pos)
+                    for chunk in response.iter_bytes():
+                        if stop.is_set():
+                            return
+                        chunk = chunk[: end - pos + 1]
+                        out.write(chunk)
+                        pos += len(chunk)
+                        with lock:
+                            received[0] += len(chunk)
+                        if pos > end:
+                            break
+                        if time.monotonic() > deadline:
+                            raise WorkshopError(
+                                f"创意工坊直链下载超时（{timeout_seconds} 秒内只下到 {_format_mb(received[0])} / {_format_mb(expected)}）"
+                            )
+                if pos > end:
+                    return
+                last_error = "连接提前结束"
+            except (WorkshopError, _RangeUnsupported):
+                raise
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                last_error = f"{urlsplit(url).hostname} HTTP {status}"
+                if _is_permanent_http_error(status):
+                    # 这个域名拿不到这份文件，换别的域名；全都拿不到才算失败。
+                    with lock:
+                        bad_urls.add(url)
+                        if len(bad_urls) >= len(urls):
+                            raise WorkshopError(f"创意工坊直链下载失败：{last_error}") from exc
+                    continue
+            except httpx.HTTPError as exc:
+                last_error = f"{urlsplit(url).hostname}: {exc or exc.__class__.__name__}"
+            attempt += 1
+            if attempt >= attempts:
+                raise WorkshopError(
+                    f"创意工坊直链下载失败（第 {index + 1}/{len(pieces)} 段试了 {attempts} 次，"
+                    f"已下载 {_format_mb(received[0])} / {_format_mb(expected)}）：{last_error}"
+                )
+            logger.warning(
+                "workshop direct piece interrupted item=%s piece=%s/%s attempt=%s/%s error=%s",
+                details.published_file_id, index + 1, len(pieces), attempt, attempts, last_error,
+            )
+            sleep(min(10, 2 * attempt))
+
+    def worker() -> None:
+        with factory() as client, open(dest_path, "r+b") as out:
+            while not stop.is_set():
+                with lock:
+                    index = next_piece[0]
+                    if index >= len(pieces):
+                        return
+                    next_piece[0] += 1
+                start, end = pieces[index]
+                fetch_piece(client, out, index, start, end)
+
+    workers = min(connections, len(pieces))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(worker) for _ in range(workers)]
+        first_error: Optional[BaseException] = None
+        for future in futures:
+            try:
+                future.result()
+            except BaseException as exc:  # noqa: BLE001  一路失败就叫停其它路，再把第一个错误抛出去
+                stop.set()
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+    return expected
+
+
+def _download_single(details, urls, dest_path, max_bytes, expected, deadline, timeout_seconds,
+                     attempts, factory, sleep) -> int:
+    """单连接下载，断了用 Range 接着下；服务器不认 Range 就从头来。"""
     written = 0
     last_error = ""
+    bad_urls: set[str] = set()
     open(dest_path, "wb").close()
 
-    for attempt in range(1, max(1, attempts) + 1):
+    for attempt in range(1, attempts + 1):
+        usable = [url for url in urls if url not in bad_urls]
+        if not usable:
+            break
+        url = usable[(attempt - 1) % len(usable)]
         headers = {"Range": f"bytes={written}-"} if written else {}
         try:
-            with factory() as client, client.stream("GET", details.file_url, headers=headers) as response:
+            with factory() as client, client.stream("GET", url, headers=headers) as response:
                 if not direct_download_host_allowed(str(response.url)):
                     raise WorkshopError("创意工坊直链被跳转到了 Steam 下载域以外的地址")
                 if written and response.status_code == 416 and expected and written >= expected:
@@ -639,10 +815,11 @@ def download_direct(
             raise
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            last_error = f"HTTP {status}"
-            # 4xx（限流和超时除外）重试也没用。
-            if 400 <= status < 500 and status not in (408, 429):
-                break
+            last_error = f"{urlsplit(url).hostname} HTTP {status}"
+            # 4xx（限流和超时除外）在这个域名上重试也没用，换别的域名。
+            if _is_permanent_http_error(status):
+                bad_urls.add(url)
+                continue
         except httpx.HTTPError as exc:
             last_error = str(exc) or exc.__class__.__name__
 

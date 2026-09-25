@@ -2531,6 +2531,8 @@ def _workshop_stage_downloads(
                 max_bytes,
                 WORKSHOP.download_timeout_seconds,
                 attempts=WORKSHOP.direct_download_attempts,
+                connections=WORKSHOP.direct_download_connections,
+                mirrors=WORKSHOP.direct_download_mirrors,
             )
             if not looks_like_vpk(dest):
                 raise WorkshopError("创意工坊直链返回的不是 VPK 文件")
