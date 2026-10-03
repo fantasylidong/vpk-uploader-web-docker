@@ -107,7 +107,7 @@ class WorkshopJobTestCase(unittest.TestCase):
 class RunWorkshopJobTest(WorkshopJobTestCase):
     def test_downloaded_item_becomes_a_server_vpk_upload(self):
         job_id = self.create_job(ids=[ITEM_ID])
-        api = FakeWorkshopApi(details={ITEM_ID: details_for(ITEM_ID)})
+        api = FakeWorkshopApi(details={ITEM_ID: details_for(ITEM_ID, title="测试地图 v1.2")})
 
         with patch.object(main, "WORKSHOP_API", api), \
              patch.object(main, "_workshop_stage_downloads", self.stage_real_vpk):
@@ -120,7 +120,7 @@ class RunWorkshopJobTest(WorkshopJobTestCase):
         self.assertEqual(job["upload_count"], 1)
         item = job["items"][0]
         self.assertEqual(item["state"], "succeeded")
-        self.assertEqual(item["title"], "测试地图")
+        self.assertEqual(item["title"], "测试地图 v1.2")
         self.assertEqual(item["download_source"], "steamcmd")
 
         db = SessionLocal()
@@ -135,6 +135,8 @@ class RunWorkshopJobTest(WorkshopJobTestCase):
             self.assertTrue(23 * 3600 < remaining <= 24 * 3600)
             self.assertEqual(upload.uploader_ip, f"workshop:{ITEM_ID}")
             self.assertTrue(upload.original_name.endswith(f"_{ITEM_ID}.vpk"))
+            self.assertEqual(upload.original_name, f"测试地图 v1.2_{ITEM_ID}.vpk")
+            self.assertEqual(upload.stored_name, f"测试地图 v1_2_{ITEM_ID}_server.vpk")
             self.assertTrue(os.path.isfile(os.path.join(main.UPLOAD_DIR, upload.stored_name)))
             report = json.loads(upload.vpk_report)
             self.assertEqual(report["upload_source"]["source"], "steam_workshop")

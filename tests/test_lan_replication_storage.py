@@ -242,6 +242,26 @@ class LanReplicationStorageTest(unittest.TestCase):
         finally:
             db.close()
 
+    def test_receive_normalizes_dotted_name_but_preserves_original(self):
+        data = b"server-vpk-content"
+        manifest = self._payload(data)
+        item = manifest['artifacts'][0]
+        item['original_name'] = 'SchoolLive V1.5.vpk'
+        item['stored_name'] = 'SchoolLive V1.5_server.vpk'
+        preflight = main._replication_preflight('node-a', manifest)
+        with patch.object(main, 'validate_vpk', return_value=valid_result()):
+            stored = asyncio.run(main.receive_lan_replication_upload(
+                request=None, source_node_id='node-a',
+                reservation_id=preflight['reservation_id'], source_upload_id=7,
+                original_name=item['original_name'], expected_sha256=item['sha256'],
+                expected_size=len(data),
+                file=UploadFile(filename=item['stored_name'], file=io.BytesIO(data)),
+            ))
+        self.assertEqual(stored['upload']['original_name'], 'SchoolLive V1.5.vpk')
+        self.assertEqual(stored['upload']['stored_name'], 'SchoolLive V1_5_server.vpk')
+        with open(os.path.join(main.UPLOAD_DIR, stored['upload']['stored_name']), 'rb') as handle:
+            self.assertEqual(handle.read(), data)
+
     def test_chunked_upload_resumes_out_of_order_and_completes_once(self):
         chunk_size = main.CHUNK_UPLOAD_STORE.chunk_size
         first_chunk = b"a" * chunk_size

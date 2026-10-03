@@ -719,7 +719,9 @@ def _sha256_file(path: str) -> str:
 
 
 def _unique_server_filename(db, work_base: str) -> str:
-    base = work_base or "upload"
+    # SRCDS's *.vpk enumeration stops at the first dot instead of backtracking.
+    # Keep original_name for display; only the final .vpk may contain a dot.
+    base = (work_base or "upload").replace(".", "_")
     index = 1
 
     while True:
@@ -767,6 +769,11 @@ def _find_active_upload_by_sha256(db, sha256: str, size: int) -> Optional[Upload
         Upload.size == size,
     ).all()
     for item in candidates:
+        # A legacy multi-dot VPK cannot be mounted reliably. Publish a normal
+        # result instead of reusing it; leave in-flight readers of the old file
+        # and its expiry/deletion lifecycle intact.
+        if "." in os.path.splitext(item.stored_name)[0]:
+            continue
         path = os.path.join(UPLOAD_DIR, item.stored_name)
         if not os.path.isfile(path):
             continue
