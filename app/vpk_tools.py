@@ -1,5 +1,8 @@
 import os
+import errno
+import fcntl
 import shutil
+import tempfile
 from typing import List, Dict
 
 from .vpk_reader import open_vpk
@@ -36,10 +39,17 @@ def extract_vpk_to_dir(vpk_path: str, out_dir: str) -> int:
         for rel in arch:  # 返回的是路径字符串
             norm_rel = _norm(rel)
             dst = os.path.join(out_dir, norm_rel)
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            data = arch.get_file(rel).read()
-            with open(dst, "wb") as w:
-                w.write(data)
+            if os.path.commonpath([os.path.abspath(out_dir), os.path.abspath(dst)]) != os.path.abspath(out_dir):
+                raise ValueError("VPK 内部路径不安全，无法解包。")
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                data = arch.get_file(rel).read()
+                with open(dst, "wb") as w:
+                    w.write(data)
+            except OSError as exc:
+                if exc.errno in (errno.EEXIST, errno.ENOTDIR, errno.EISDIR, errno.ENAMETOOLONG):
+                    raise ValueError("VPK 内部路径冲突或过长，无法解包。") from exc
+                raise
             count += 1
     return count
 
@@ -75,49 +85,24 @@ def build_vpk_from_dir(dir_path: str, dest_vpk_path: str) -> None:
 def process_server_vpk(
     src_vpk_path: str,
     work_dir_root: str,
-    work_base_name: str,
     output_dir: str,
     output_filename: str
 ) -> Dict:
     """
-    工作流：
-      /tmp/<work_base_name>/extracted  ← 解包到这里
-      /tmp/<work_base_name>/server_dir ← 白名单筛选后放这里
-    解包完成后，立刻删除 src_vpk_path；
-    最后把重打包的服务器版写到 output_dir/<output_filename>。
+    在独占的临时目录中解包、筛选、重打包，异常时也清理工作目录。
+    工作目录锁供定时清理识别仍在运行的构建。
     """
-    work = os.path.join(work_dir_root, work_base_name)
-    ext_dir = os.path.join(work, "extracted")
-    server_dir = os.path.join(work, "server_dir")
-
-    # 清理旧的同名工作目录（若有）
-    if os.path.isdir(work):
-        shutil.rmtree(work, ignore_errors=True)
-    os.makedirs(ext_dir, exist_ok=True)
-    os.makedirs(server_dir, exist_ok=True)
-
-    # 1) 解包
-    total_entries = extract_vpk_to_dir(src_vpk_path, ext_dir)
-
-    # 2) 解包完成后，删除原始 /tmp 的 vpk
-    try:
-        os.remove(src_vpk_path)
-    except Exception:
-        pass
-
-    # 3) 白名单筛选
-    stats = _filter_copy(ext_dir, server_dir, SERVER_KEEP_GLOBS)
-
-    # 4) 重打包到 uploads
-    os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, output_filename)
-    build_vpk_from_dir(server_dir, out_path)
-
-    # 5) 清理工作目录
-    try:
-        shutil.rmtree(work, ignore_errors=True)
-    except Exception:
-        pass
+    with tempfile.TemporaryDirectory(prefix="vpk-work-", dir=work_dir_root) as work:
+        with open(os.path.join(work, ".lock"), "wb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            ext_dir = os.path.join(work, "extracted")
+            server_dir = os.path.join(work, "server_dir")
+            total_entries = extract_vpk_to_dir(src_vpk_path, ext_dir)
+            os.remove(src_vpk_path)
+            stats = _filter_copy(ext_dir, server_dir, SERVER_KEEP_GLOBS)
+            os.makedirs(output_dir, exist_ok=True)
+            out_path = os.path.join(output_dir, output_filename)
+            build_vpk_from_dir(server_dir, out_path)
 
     return {
         "entries": total_entries,

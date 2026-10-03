@@ -7,6 +7,7 @@ import secrets
 import json
 import logging
 import threading
+import tempfile
 import time
 import select
 import subprocess
@@ -537,6 +538,8 @@ def _basename_only(filename: str) -> str:
 def _split_supported_upload(filename: str):
     """上传文件必须是 VPK 或受支持的压缩包。"""
     base = _basename_only(filename)
+    if len(base.encode("utf-8")) > 240:
+        raise HTTPException(status_code=400, detail="文件名过长")
     lower = base.lower()
     for ext in UPLOAD_EXTENSIONS:
         if lower.endswith(ext) and base[:-len(ext)].strip():
@@ -544,9 +547,11 @@ def _split_supported_upload(filename: str):
     raise HTTPException(status_code=400, detail=f"文件名非法：仅支持 {UPLOAD_TYPE_LABEL}")
 
 
-def _ensure_vpk_filename(filename: str) -> str:
+def _ensure_vpk_filename(filename: str, max_bytes: int = 255) -> str:
     """返回安全的 VPK 文件名。"""
     base = _basename_only(filename)
+    if len(base.encode("utf-8")) > max_bytes:
+        raise HTTPException(status_code=400, detail="文件名过长")
     if not base.lower().endswith(".vpk") or not base[:-4].strip():
         raise HTTPException(status_code=400, detail="VPK 文件名非法：必须以 .vpk 结尾")
     return base
@@ -715,15 +720,16 @@ def _sha256_file(path: str) -> str:
 
 def _unique_server_filename(db, work_base: str) -> str:
     base = work_base or "upload"
-    candidate = f"{base}_server.vpk"
-    index = 2
+    index = 1
 
     while True:
+        suffix = "_server.vpk" if index == 1 else f"_{index}_server.vpk"
+        stem = base.encode("utf-8")[:255 - len(suffix)].decode("utf-8", errors="ignore")
+        candidate = stem + suffix
         path = os.path.join(UPLOAD_DIR, candidate)
         exists_in_db = db.query(Upload.id).filter(Upload.stored_name == candidate).first() is not None
         if not exists_in_db and not os.path.exists(path):
             return candidate
-        candidate = f"{base}_{index}_server.vpk"
         index += 1
 
 
@@ -798,7 +804,7 @@ def _process_vpk_upload(
     upload_max_mb: int,
     current_chunk_reservation: int = 0,
 ):
-    display_name = _ensure_vpk_filename(source_vpk_name)
+    display_name = _ensure_vpk_filename(source_vpk_name, max_bytes=240)
     work_base = _safe_base_no_ext(display_name)
 
     try:
@@ -816,68 +822,88 @@ def _process_vpk_upload(
         }
 
     db = SessionLocal()
+    staged_path = None
     final_name = None
     try:
-        expires_at = _expiry_for_upload(db, role, ttl_hours)
-        final_name = _unique_server_filename(db, work_base)
+        # 未发布的文件不能使用最终名称，否则并发上传和 SFTP 扫描会把它当成成品。
+        with tempfile.NamedTemporaryFile(prefix=".upload-", suffix=".part", dir=UPLOAD_DIR, delete=False) as staged:
+            staged_path = staged.name
+            fcntl.flock(staged, fcntl.LOCK_EX)
+            try:
+                build_report = process_server_vpk(
+                    src_vpk_path=tmp_vpk_path,
+                    work_dir_root=TMP_DIR,
+                    output_dir=UPLOAD_DIR,
+                    output_filename=os.path.basename(staged_path),
+                )
+            except ValueError as exc:
+                logger.warning("VPK upload rejected source=%r: %s", display_name, exc)
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        build_report = process_server_vpk(
-            src_vpk_path=tmp_vpk_path,
-            work_dir_root=TMP_DIR,
-            work_base_name=f"{work_base}_{secrets.token_hex(4)}",
-            output_dir=UPLOAD_DIR,
-            output_filename=final_name,
-        )
+            server_size = os.path.getsize(staged_path)
+            server_sha256 = _sha256_file(staged_path)
+            upload_source = {**upload_source, "uploaded_sha256": upload_sha256}
 
-        server_path = os.path.join(UPLOAD_DIR, final_name)
-        server_size = os.path.getsize(server_path) if os.path.exists(server_path) else 0
-        server_sha256 = _sha256_file(server_path)
-        upload_source = {**upload_source, "uploaded_sha256": upload_sha256}
-        report = {"upload_source": upload_source, "validation": vr.to_dict(), "server_build": build_report}
+            with capacity_guard():
+                expires_at = _expiry_for_upload(db, role, ttl_hours)
+                existing = _find_active_upload_by_sha256(db, server_sha256, server_size)
+                if existing is not None:
+                    _extend_expiry(existing, expires_at)
+                    db.commit()
+                    result = _upload_item_result(existing)
+                    result["deduplicated"] = True
+                    return existing, result
 
-        with capacity_guard():
-            existing = _find_active_upload_by_sha256(db, server_sha256, server_size)
-            if existing is not None:
-                _remove_file_quietly(server_path)
-                _extend_expiry(existing, expires_at)
-                db.commit()
-                result = _upload_item_result(existing)
-                result["deduplicated"] = True
-                return existing, result
+                capacity_error = total_capacity_error(
+                    db,
+                    server_size,
+                    current_chunk_reservation=current_chunk_reservation,
+                )
+                if capacity_error:
+                    return None, {"name": display_name, "error": capacity_error}
 
-            capacity_error = total_capacity_error(
-                db,
-                server_size,
-                current_chunk_reservation=current_chunk_reservation,
-            )
-            if capacity_error:
-                _remove_file_quietly(server_path)
-                return None, {"name": display_name, "error": capacity_error}
-
-            up = Upload(
-                original_name=display_name,
-                stored_name=final_name,
-                sha256=server_sha256,
-                size=server_size,
-                role=role,
-                created_at=now_utc(),
-                expires_at=expires_at,
-                vpk_valid=True,
-                vpk_report=json.dumps(report, ensure_ascii=False),
-                status="active",
-                uploader_ip=uploader_ip,
-            )
-            db.add(up)
-            db.commit()
-            db.refresh(up)
-            result = _upload_item_result(up)
-            return up, result
+                final_name = _unique_server_filename(db, work_base)
+                final_path = os.path.join(UPLOAD_DIR, final_name)
+                build_report["server"]["path"] = final_path
+                report = {"upload_source": upload_source, "validation": vr.to_dict(), "server_build": build_report}
+                up = Upload(
+                    original_name=display_name,
+                    stored_name=final_name,
+                    sha256=server_sha256,
+                    size=server_size,
+                    role=role,
+                    created_at=now_utc(),
+                    expires_at=expires_at,
+                    vpk_valid=True,
+                    vpk_report=json.dumps(report, ensure_ascii=False),
+                    status="active",
+                    uploader_ip=uploader_ip,
+                )
+                published = False
+                try:
+                    db.add(up)
+                    db.flush()
+                    # 游戏进程以 louis 运行，需要读取由上传器 root 用户生成的成品。
+                    os.chmod(staged_path, 0o644)
+                    os.replace(staged_path, final_path)
+                    published = True
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    if published:
+                        _remove_file_quietly(final_path)
+                    raise
+                # 提交后的刷新/响应错误不能再删除已经入库的文件。
+                db.refresh(up)
+                return up, _upload_item_result(up)
+    except HTTPException:
+        raise
     except Exception:
-        if final_name:
-            _remove_file_quietly(os.path.join(UPLOAD_DIR, final_name))
-        _remove_file_quietly(tmp_vpk_path)
+        logger.exception("VPK upload failed source=%r stored_name=%r", display_name, final_name)
         raise
     finally:
+        _remove_file_quietly(staged_path)
+        _remove_file_quietly(tmp_vpk_path)
         db.close()
 
 
@@ -937,53 +963,60 @@ def sync_sftp_uploads(now_ts: Optional[float] = None) -> dict[str, int | bool]:
             try:
                 imported_at = now_utc()
                 file_sha256 = _sha256_file(path)
-                final_stat = os.stat(path)
-                if final_stat.st_size != stat.st_size or final_stat.st_mtime_ns != stat.st_mtime_ns:
-                    stats["deferred"] += 1
-                    continue
-                report = {
-                    "validation": {
-                        "ok": True,
-                        "source": "sftp",
-                        "message": "SFTP 上传按管理员上传处理，未经过网页端校验和重打包。",
-                    },
-                    "sftp_import": {
-                        "imported_at": imported_at.isoformat(),
-                        "mtime": stat.st_mtime,
-                        "note": "SFTP 上传文件按管理员上传处理，未经过网页端重打包。",
+                with capacity_guard():
+                    # 发布方可能刚完成提交，必须重新查询，不能沿用扫描开始时的快照。
+                    db.expire_all()
+                    existing = db.query(Upload).filter(Upload.stored_name == name).first()
+                    if existing and existing.status == "active" and not _file_newer_than_upload_record(stat, existing):
+                        stats["existing"] += 1
+                        continue
+                    final_stat = os.stat(path)
+                    if final_stat.st_size != stat.st_size or final_stat.st_mtime_ns != stat.st_mtime_ns:
+                        stats["deferred"] += 1
+                        continue
+                    report = {
+                        "validation": {
+                            "ok": True,
+                            "source": "sftp",
+                            "message": "SFTP 上传按管理员上传处理，未经过网页端校验和重打包。",
+                        },
+                        "sftp_import": {
+                            "imported_at": imported_at.isoformat(),
+                            "mtime": stat.st_mtime,
+                            "note": "SFTP 上传文件按管理员上传处理，未经过网页端重打包。",
+                        }
                     }
-                }
-                if existing:
-                    existing.original_name = name
-                    existing.sha256 = file_sha256
-                    existing.size = stat.st_size
-                    existing.role = "admin"
-                    existing.created_at = imported_at
-                    existing.expires_at = None
-                    existing.vpk_valid = True
-                    existing.vpk_report = json.dumps(report, ensure_ascii=False)
-                    existing.status = "active"
-                    existing.uploader_ip = "sftp"
-                    stats["updated"] += 1
-                else:
-                    existing = Upload(
-                        original_name=name,
-                        stored_name=name,
-                        sha256=file_sha256,
-                        size=stat.st_size,
-                        role="admin",
-                        created_at=imported_at,
-                        expires_at=None,
-                        vpk_valid=True,
-                        vpk_report=json.dumps(report, ensure_ascii=False),
-                        status="active",
-                        uploader_ip="sftp",
-                    )
-                    db.add(existing)
-                    stats["imported"] += 1
+                    if existing:
+                        existing.original_name = name
+                        existing.sha256 = file_sha256
+                        existing.size = stat.st_size
+                        existing.role = "admin"
+                        existing.created_at = imported_at
+                        existing.expires_at = None
+                        existing.vpk_valid = True
+                        existing.vpk_report = json.dumps(report, ensure_ascii=False)
+                        existing.status = "active"
+                        existing.uploader_ip = "sftp"
+                        stats["updated"] += 1
+                    else:
+                        existing = Upload(
+                            original_name=name,
+                            stored_name=name,
+                            sha256=file_sha256,
+                            size=stat.st_size,
+                            role="admin",
+                            created_at=imported_at,
+                            expires_at=None,
+                            vpk_valid=True,
+                            vpk_report=json.dumps(report, ensure_ascii=False),
+                            status="active",
+                            uploader_ip="sftp",
+                        )
+                        db.add(existing)
+                        stats["imported"] += 1
 
-                db.commit()
-                by_name[name] = existing
+                    db.commit()
+                    by_name[name] = existing
             except Exception:
                 db.rollback()
                 stats["errors"] += 1
@@ -1083,20 +1116,23 @@ def cleanup_replication_reservations():
 def cleanup_tmp_and_work():
     now_ts = time.time()
 
-    # 清理 /tmp 中遗留的工作目录（/tmp/<原名>/...）
     try:
-        for name in os.listdir(TMP_DIR):
-            p = os.path.join(TMP_DIR, name)
-            # 仅清理我们创建的工作目录痕迹：目录且最近未改动
-            if os.path.isdir(p):
-                age = now_ts - os.path.getmtime(p)
-                if age > WORK_MAX_AGE_MIN * 60:
-                    try:
-                        shutil.rmtree(p, ignore_errors=True)
-                    except Exception:
-                        pass
-    except Exception:
-        pass
+        work_names = os.listdir(TMP_DIR)
+    except OSError:
+        work_names = []
+    for name in work_names:
+        if not name.startswith("vpk-work-"):
+            continue
+        path = os.path.join(TMP_DIR, name)
+        try:
+            if not os.path.isdir(path) or now_ts - os.path.getmtime(path) <= WORK_MAX_AGE_MIN * 60:
+                continue
+            with open(os.path.join(path, ".lock"), "ab") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                shutil.rmtree(path)
+        except OSError:
+            # 正在构建，或已经由另一请求清理。
+            continue
 
     try:
         CHUNK_UPLOAD_STORE.cleanup_expired()
@@ -1118,11 +1154,16 @@ def cleanup_tmp_and_work():
     try:
         max_partial_age = max(WORK_MAX_AGE_MIN * 60, LAN_REPLICATION.reservation_ttl_seconds)
         for name in os.listdir(UPLOAD_DIR):
-            if not (name.startswith(".lan-") and name.endswith(".part")):
+            if not (name.startswith((".lan-", ".upload-")) and name.endswith(".part")):
                 continue
             path = os.path.join(UPLOAD_DIR, name)
             if os.path.isfile(path) and now_ts - os.path.getmtime(path) > max_partial_age:
-                _remove_file_quietly(path)
+                try:
+                    with open(path, "rb") as partial:
+                        fcntl.flock(partial, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        _remove_file_quietly(path)
+                except OSError:
+                    continue
     except Exception:
         pass
 
@@ -1445,8 +1486,6 @@ async def create_chunk_upload(request: Request):
         raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
 
     original_name, _ = _split_supported_upload(str(payload.get("filename", "")))
-    if len(original_name.encode("utf-8")) > 240:
-        raise HTTPException(status_code=400, detail="文件名过长")
     try:
         size = int(payload.get("size", 0))
     except (TypeError, ValueError) as exc:
