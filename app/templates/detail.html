@@ -10,7 +10,7 @@
     </div>
     <div class="record-actions">
       <span class="status-tag">{{ item.status }}</span>
-      <a class="btn" href="/d/{{ item.id }}">下载服务器版</a>
+      <a class="btn" href="/d/{{ item.id }}">下载 VPK</a>
     </div>
   </header>
   <dl class="record-meta">
@@ -24,7 +24,7 @@
   </details>
   {% if report.server_build %}
   <details open class="inspection">
-    <summary>服务器版构建报告</summary>
+    <summary>VPK 处理报告</summary>
     <pre tabindex="0">{{ report.server_build | tojson }}</pre>
   </details>
   {% endif %}

@@ -11,7 +11,7 @@ import tests._bootstrap  # noqa: E402,F401  必须先于 app.main 导入，只�
 from app import main  # noqa: E402
 from app.db import SessionLocal, Upload, WorkshopJob  # noqa: E402
 from app.steam_workshop import WorkshopError, WorkshopItemDetails  # noqa: E402
-from app.vpk_tools import build_vpk_from_dir  # noqa: E402
+from vpk import NewVPK  # noqa: E402
 
 ITEM_ID = "2547462987"
 OTHER_ITEM_ID = "1234567890"
@@ -63,7 +63,7 @@ def make_vpk(dest_path: str) -> None:
             handle.write('"AddonInfo"\n{\n\t"addontitle"\t"测试地图"\n}\n')
         with open(os.path.join(work, "maps", "test_map.bsp"), "wb") as handle:
             handle.write(b"VBSP" + b"\0" * 4096)
-        build_vpk_from_dir(work, dest_path)
+        NewVPK(work).save(dest_path)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

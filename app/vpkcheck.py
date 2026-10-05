@@ -22,7 +22,10 @@ class ValidationResult:
         return asdict(self)
 
 def _norm(p: str) -> str:
-    return p.replace("\\", "/").lstrip("./").lower()
+    p = p.replace("\\", "/")
+    if p.startswith("/") or ".." in p.split("/") or ":" in p:
+        raise ValueError("VPK 内部路径不安全。")
+    return p.lstrip("./").lower()
 
 def _load_rules(path: str) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -35,10 +38,17 @@ def validate_vpk(vpk_path: str, rules_path: str, max_size_mb_override: Optional[
     block_globs = [s.lower() for s in rules.get("block_globs", [])]
     warn_globs = [s.lower() for s in rules.get("warn_globs", [])]
 
-    size_mb = os.path.getsize(vpk_path) / (1024 * 1024)
+    size_bytes = os.path.getsize(vpk_path)
+    size_mb = size_bytes / (1024 * 1024)
 
     with open_vpk(vpk_path) as arch:
         entries = [_norm(rel) for rel in arch]  # 注意：返回的是路径字符串
+        for rel in arch:
+            meta = arch.get_file_meta(rel)
+            if meta['archive_index'] != 0x7fff:
+                raise ValueError("仅支持包含完整内容的单文件 VPK，不支持依赖外部分卷的 VPK。")
+            if meta['archive_offset'] + meta['file_length'] > size_bytes:
+                raise ValueError("VPK 文件内容不完整。")
 
     file_count = len(entries)
 

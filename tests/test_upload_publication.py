@@ -97,6 +97,65 @@ class UploadPublicationTest(unittest.TestCase):
                 self.assertEqual(len({r['id'] for r in results}), 1 if identical else 2)
                 self.check_records(1 if identical else 2)
 
+    def test_reupload_preserves_original_bytes_and_all_resources(self):
+        entries = [('addoninfo.txt', b'AddonInfo {}'), ('maps/test.bsp', b'VBSP')]
+        for suffix in ('mdl', 'vvd', 'dx90.vtx', 'phy', 'ani'):
+            entries.append((f'models/custom/props/door.{suffix}', suffix.encode() + bytes(range(256)) * 40))
+        entries.extend([
+            ('materials/models/custom/door.vmt', b'VertexLitGeneric {}'),
+            ('materials/models/custom/door.vtf', b'VTF\0\xff\x80'),
+            ('scripts/vscripts/custom/door.nut', b'print("door")'),
+            ('missions/custom.txt', b'"mission" {}'),
+            ('sound/custom/door.wav', b'RIFF\0\xff'),
+            ('particles/custom.pcf', b'particles'),
+            ('resource/custom.res', b'resource'),
+            ('scripts/custom.txt', b'script'),
+            ('preview.jpg', b'preview'),
+        ])
+        source = vpk_bytes(entries)
+        # 已有裁剪包仅包含地图，重新上传完整包应新增记录。
+        legacy = self.upload(map_bytes())
+        legacy_path = Path(main.UPLOAD_DIR) / legacy['stored_name']
+        legacy_data = legacy_path.read_bytes()
+
+        result = self.upload(source)
+        self.assertNotEqual(result['id'], legacy['id'])
+        self.assertEqual((Path(main.UPLOAD_DIR) / result['stored_name']).read_bytes(), source)
+        self.assertEqual(result['sha256'], hashlib.sha256(source).hexdigest())
+        with open_vpk(str(Path(main.UPLOAD_DIR) / result['stored_name'])) as archive:
+            self.assertEqual(set(archive), {path for path, _ in entries})
+            for path, data in entries:
+                with archive.get_file(path) as entry:
+                    self.assertEqual(entry.read(), data, path)
+                    self.assertTrue(entry.verify(), path)
+        self.assertEqual(legacy_path.read_bytes(), legacy_data)
+        self.assertEqual(self.upload(source)['id'], result['id'])
+        with SessionLocal() as db:
+            report = json.loads(db.get(Upload, result['id']).vpk_report)['server_build']
+            self.assertEqual(report['mode'], 'original')
+            self.assertEqual(report['server']['removed'], 0)
+        self.check_records(2)
+
+    def test_original_upload_preserves_unicode_and_nonfilesystem_paths(self):
+        entries = [
+            ('addoninfo.txt', b'AddonInfo {}'),
+            ('maps/测试.bsp', b'VBSP\0\xff' * 2000),
+            ('scripts/vscripts/机关/door.nut', b'print("door")'),
+            ('missions/café.txt', b'"mission" {}'),
+            ('maps/clash.txt', b'x'),
+            ('maps/clash.txt/map.bsp', b'VBSP'),
+            ('maps/' + 'x' * 256 + '.bsp', b'VBSP'),
+        ]
+        source = vpk_bytes(entries)
+        result = self.upload(source)
+        self.assertEqual((Path(main.UPLOAD_DIR) / result['stored_name']).read_bytes(), source)
+        with open_vpk(str(Path(main.UPLOAD_DIR) / result['stored_name'])) as archive:
+            self.assertEqual(set(archive), {path for path, _ in entries})
+            for path, data in entries:
+                with archive.get_file(path) as entry:
+                    self.assertEqual(entry.read(), data, path)
+                    self.assertTrue(entry.verify(), path)
+
     def test_sftp_cannot_import_a_build_before_publication(self):
         real_build = main.process_server_vpk
 
@@ -152,23 +211,24 @@ class UploadPublicationTest(unittest.TestCase):
                     self.upload(map_bytes())
         self.check_records(1)
 
-    def test_cleanup_skips_active_work_and_unrelated_directories(self):
+    def test_cleanup_skips_active_copy_and_unrelated_directories(self):
         unrelated = Path(tempfile.mkdtemp(dir=main.TMP_DIR, prefix='other-'))
         self.addCleanup(shutil.rmtree, unrelated, True)
-        old = time.time() - main.WORK_MAX_AGE_MIN * 60 - 10
+        old = time.time() - max(main.WORK_MAX_AGE_MIN * 60, main.LAN_REPLICATION.reservation_ttl_seconds) - 10
         os.utime(unrelated, (old, old))
-        real_filter = vpk_tools._filter_copy
+        real_copy = vpk_tools.shutil.copyfile
 
-        def cleanup_during_build(*args):
-            result = real_filter(*args)
-            work = Path(args[1]).parent
-            os.utime(work, (old, old))
+        def cleanup_during_copy(src, dst):
+            inode = os.stat(dst).st_ino
+            result = real_copy(src, dst)
+            self.assertEqual(os.stat(dst).st_ino, inode)
+            os.utime(dst, (old, old))
             main.cleanup_tmp_and_work()
-            self.assertTrue(work.is_dir())
+            self.assertTrue(Path(dst).is_file())
             self.assertTrue(unrelated.is_dir())
             return result
 
-        with patch.object(vpk_tools, '_filter_copy', cleanup_during_build):
+        with patch.object(vpk_tools.shutil, 'copyfile', cleanup_during_copy):
             result = self.upload(map_bytes())
         with open_vpk(str(Path(main.UPLOAD_DIR) / result['stored_name'])) as archive:
             self.assertIn('maps/test.bsp', list(archive))
@@ -177,8 +237,8 @@ class UploadPublicationTest(unittest.TestCase):
 
     def test_bad_archive_paths_and_long_names_are_http_400(self):
         cases = [
-            ('conflict.vpk', vpk_bytes([('addoninfo.txt', b'AddonInfo {}'), ('maps/clash.txt', b'x'), ('maps/clash.txt/map.bsp', b'VBSP')])),
-            ('longentry.vpk', vpk_bytes([('addoninfo.txt', b'AddonInfo {}'), ('maps/' + 'x' * 256 + '.bsp', b'VBSP')])),
+            ('traversal.vpk', vpk_bytes([('addoninfo.txt', b'AddonInfo {}'), ('maps/../../outside.bsp', b'VBSP')])),
+            ('absolute.vpk', vpk_bytes([('addoninfo.txt', b'AddonInfo {}'), ('/maps/test.bsp', b'VBSP')])),
             ('x' * 250 + '.vpk', map_bytes()),
             ('图' * 81 + '.vpk', map_bytes()),
         ]
@@ -205,6 +265,29 @@ class UploadPublicationTest(unittest.TestCase):
         asyncio.run(exercise())
         self.check_records(0)
         self.assertFalse(list(Path(main.TMP_DIR).glob('vpk-work-*')))
+
+    def test_original_upload_rejects_external_chunks_and_truncated_payloads(self):
+        source = map_bytes()
+        metadata_offset = source.index(b'test\0') + len(b'test\0')
+        external = bytearray(source)
+        struct.pack_into('<H', external, metadata_offset + 6, 0)
+        truncated = bytearray(source)
+        struct.pack_into('<II', truncated, metadata_offset + 8, len(source), 1)
+        for data in (bytes(external), bytes(truncated)):
+            with self.subTest(data=data):
+                with self.assertRaises(main.HTTPException) as error:
+                    self.upload(data)
+                self.assertEqual(error.exception.status_code, 400)
+        self.check_records(0)
+
+    def test_original_upload_still_enforces_blocked_files(self):
+        result = self.upload(vpk_bytes([
+            ('addoninfo.txt', b'AddonInfo {}'),
+            ('maps/test.bsp', b'VBSP'),
+            ('cfg/server.cfg', b'blocked'),
+        ]))
+        self.assertEqual(result['report']['blocked_hits'], ['cfg/server.cfg'])
+        self.check_records(0)
 
     def test_maximum_source_name_remains_valid_for_lan_replication(self):
         for name in ('x' * 236 + '.vpk', '图' * 78 + 'ab.vpk'):

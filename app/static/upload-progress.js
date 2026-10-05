@@ -375,7 +375,7 @@
       if (Date.now() >= deadline) {
         throw new Error("服务器处理时间过长，请稍后重新提交以查询结果");
       }
-      setProgress(progress, 100, "服务器正在校验并生成服务器版...");
+      setProgress(progress, 100, "服务器正在校验并保存原包...");
       await delay(2000);
       var status = await loadSession(record);
       if (status.status !== "processing") {
@@ -500,7 +500,7 @@
     }
     progress.classList.add("is-processing");
     cancelButton.disabled = true;
-    setProgress(progress, 100, "上传完成，正在校验并生成服务器版...");
+    setProgress(progress, 100, "上传完成，正在校验并保存原包...");
     try {
       var result = await completeSession(restored.record);
       if (result.status === "processing") {
