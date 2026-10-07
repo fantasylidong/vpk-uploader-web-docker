@@ -1,10 +1,10 @@
 import os
 import fnmatch
 import yaml
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import List, Dict, Optional
 
-from .vpk_reader import open_vpk
+from .vpk_integrity import inspect_vpk
 
 @dataclass
 class ValidationResult:
@@ -17,6 +17,7 @@ class ValidationResult:
     warned_hits: List[str]
     file_count: int
     sample_files: List[str]
+    repairable_issues: List[str] = field(default_factory=list)
 
     def to_dict(self):
         return asdict(self)
@@ -31,7 +32,8 @@ def _load_rules(path: str) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
-def validate_vpk(vpk_path: str, rules_path: str, max_size_mb_override: Optional[int] = None) -> ValidationResult:
+def validate_vpk(vpk_path: str, rules_path: str, max_size_mb_override: Optional[int] = None,
+                 allow_repair: bool = False) -> ValidationResult:
     rules = _load_rules(rules_path)
     max_size_mb = max_size_mb_override if max_size_mb_override is not None else rules.get("max_size_mb", 600)
     require_files = [s.lower() for s in rules.get("require_files", [])]
@@ -41,14 +43,9 @@ def validate_vpk(vpk_path: str, rules_path: str, max_size_mb_override: Optional[
     size_bytes = os.path.getsize(vpk_path)
     size_mb = size_bytes / (1024 * 1024)
 
-    with open_vpk(vpk_path) as arch:
-        entries = [_norm(rel) for rel in arch]  # 注意：返回的是路径字符串
-        for rel in arch:
-            meta = arch.get_file_meta(rel)
-            if meta['archive_index'] != 0x7fff:
-                raise ValueError("仅支持包含完整内容的单文件 VPK，不支持依赖外部分卷的 VPK。")
-            if meta['archive_offset'] + meta['file_length'] > size_bytes:
-                raise ValueError("VPK 文件内容不完整。")
+    inspection = inspect_vpk(vpk_path, allow_repair=allow_repair,
+                             max_content_bytes=max_size_mb * 1024 * 1024)
+    entries = [_norm(entry.path) for entry in inspection.entries]
 
     file_count = len(entries)
 
@@ -78,4 +75,5 @@ def validate_vpk(vpk_path: str, rules_path: str, max_size_mb_override: Optional[
         warned_hits=warned_hits[:50],
         file_count=file_count,
         sample_files=entries[:20],
+        repairable_issues=inspection.repairs,
     )

@@ -814,20 +814,6 @@ def _process_vpk_upload(
     display_name = _ensure_vpk_filename(source_vpk_name, max_bytes=240)
     work_base = _safe_base_no_ext(display_name)
 
-    try:
-        vr: ValidationResult = validate_vpk(tmp_vpk_path, RULES_FILE, max_size_mb_override=upload_max_mb)
-    except Exception as exc:
-        _remove_file_quietly(tmp_vpk_path)
-        raise HTTPException(status_code=400, detail=f"VPK 读取失败：{exc}")
-
-    if not vr.ok:
-        _remove_file_quietly(tmp_vpk_path)
-        return None, {
-            "name": display_name,
-            "error": "VPK 不符合要求",
-            "report": vr.to_dict(),
-        }
-
     db = SessionLocal()
     staged_path = None
     final_name = None
@@ -842,10 +828,30 @@ def _process_vpk_upload(
                     work_dir_root=TMP_DIR,
                     output_dir=UPLOAD_DIR,
                     output_filename=os.path.basename(staged_path),
+                    max_size_bytes=upload_max_mb * 1024 * 1024,
                 )
             except ValueError as exc:
                 logger.warning("VPK upload rejected source=%r: %s", display_name, exc)
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+            # 成品必须重新过完整规则；只有通过后才可发布到游戏挂载目录和参与复制。
+            try:
+                vr = validate_vpk(staged_path, RULES_FILE, max_size_mb_override=upload_max_mb)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if not vr.ok:
+                reasons = []
+                if vr.missing_required:
+                    reasons.append("缺少必需文件：" + "、".join(vr.missing_required))
+                if vr.blocked_hits:
+                    reasons.append("包含禁止部署的文件：" + "、".join(vr.blocked_hits[:5]))
+                if vr.size_mb > vr.max_size_mb:
+                    reasons.append(f"文件超过 {vr.max_size_mb} MB 限制")
+                return None, {
+                    "name": display_name,
+                    "error": "地图有问题，无法部署：" + "；".join(reasons),
+                    "report": vr.to_dict(),
+                }
 
             server_size = os.path.getsize(staged_path)
             server_sha256 = _sha256_file(staged_path)
@@ -981,12 +987,22 @@ def sync_sftp_uploads(now_ts: Optional[float] = None) -> dict[str, int | bool]:
                     if final_stat.st_size != stat.st_size or final_stat.st_mtime_ns != stat.st_mtime_ns:
                         stats["deferred"] += 1
                         continue
+                    try:
+                        validation = validate_vpk(path, RULES_FILE, max_size_mb_override=get_upload_max_mb(db))
+                        if not validation.ok:
+                            raise ValueError("地图有问题，无法部署：SFTP 文件未通过规则校验")
+                    except ValueError as exc:
+                        # SFTP 已经直接写入挂载目录；只拒绝登记，不擅自移动管理员的文件。
+                        if existing:
+                            existing.vpk_valid = False
+                            existing.status = "invalid"
+                            existing.vpk_report = json.dumps({"validation": {"ok": False, "error": str(exc)}}, ensure_ascii=False)
+                            db.commit()
+                        stats["errors"] += 1
+                        logger.warning("SFTP VPK rejected name=%r: %s", name, exc)
+                        continue
                     report = {
-                        "validation": {
-                            "ok": True,
-                            "source": "sftp",
-                            "message": "SFTP 上传按管理员上传处理，未经过网页端校验和重打包。",
-                        },
+                        "validation": validation.to_dict(),
                         "sftp_import": {
                             "imported_at": imported_at.isoformat(),
                             "mtime": stat.st_mtime,
@@ -1799,6 +1815,14 @@ def _replication_preflight(source_node_id: str, payload: Any) -> dict[str, Any]:
             missing = []
             for item in items:
                 existing = _find_active_upload_by_sha256(db, item["sha256"], item["size"])
+                if existing is not None:
+                    try:
+                        validation = validate_vpk(os.path.join(UPLOAD_DIR, existing.stored_name),
+                                                  RULES_FILE, max_size_mb_override=get_upload_max_mb(db))
+                        if not validation.ok:
+                            existing = None
+                    except ValueError:
+                        existing = None
                 if existing is None:
                     missing.append(item)
                 else:

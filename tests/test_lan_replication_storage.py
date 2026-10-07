@@ -19,6 +19,7 @@ from starlette.datastructures import UploadFile  # noqa: E402
 from app import main  # noqa: E402
 from app.db import ReplicationReservation, SessionLocal, Upload  # noqa: E402
 from app.vpkcheck import ValidationResult  # noqa: E402
+from tests.test_upload_publication import map_bytes
 
 
 def valid_result() -> ValidationResult:
@@ -134,7 +135,7 @@ class LanReplicationStorageTest(unittest.TestCase):
     def test_sftp_scan_imports_existing_vpk_once(self):
         path = os.path.join(main.UPLOAD_DIR, "sftp-map.vpk")
         with open(path, "wb") as handle:
-            handle.write(b"existing-vpk")
+            handle.write(map_bytes())
         old_time = main.time.time() - main.SFTP_IMPORT_MIN_AGE_SECONDS - 1
         os.utime(path, (old_time, old_time))
 
@@ -153,7 +154,7 @@ class LanReplicationStorageTest(unittest.TestCase):
             self.assertEqual(uploads[0].role, "admin")
             self.assertEqual(uploads[0].status, "active")
             self.assertIsNone(uploads[0].expires_at)
-            self.assertEqual(uploads[0].sha256, hashlib.sha256(b"existing-vpk").hexdigest())
+            self.assertEqual(uploads[0].sha256, hashlib.sha256(map_bytes()).hexdigest())
         finally:
             db.close()
 
@@ -206,7 +207,7 @@ class LanReplicationStorageTest(unittest.TestCase):
         self.assertEqual(result["storage"]["available_bytes"], 124 * 1024)
 
     def test_receive_validates_hash_stores_once_and_deduplicates(self):
-        data = b"server-vpk-content"
+        data = map_bytes()
         sha256 = hashlib.sha256(data).hexdigest()
         preflight = main._replication_preflight("node-a", self._payload(data, sha256))
         upload_file = UploadFile(filename="map_server.vpk", file=io.BytesIO(data))

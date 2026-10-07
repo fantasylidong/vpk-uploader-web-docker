@@ -23,6 +23,9 @@
     <pre tabindex="0">{{ report.validation | tojson }}</pre>
   </details>
   {% if report.server_build %}
+  {% if report.server_build.mode == 'repaired' %}
+  <p role="status">地图包的目录错误已修复并重新打包，全部资源均保留，成品已重新通过校验。</p>
+  {% endif %}
   <details open class="inspection">
     <summary>VPK 处理报告</summary>
     <pre tabindex="0">{{ report.server_build | tojson }}</pre>
