@@ -231,7 +231,8 @@ class VPKIntegrityTest(unittest.TestCase):
         now = main.time.time()
         os.utime(path, (now - 120, now - 120))
         self.assertEqual(main.sync_sftp_uploads()['imported'], 1)
-        path.write_bytes(missing_outer_terminator(publication.map_bytes()))
+        # SFTP 现在也会无损修复缺失终止符；真正损坏的内容仍须拒绝并保留原件。
+        path.write_bytes(publication.map_bytes().replace(b'VBSP', b'FAIL'))
         os.utime(path, (now + 3, now + 3))
         with self.assertLogs(main.logger, level='WARNING'):
             self.assertEqual(main.sync_sftp_uploads(now_ts=now + 120)['errors'], 1)

@@ -26,6 +26,7 @@ from .vpkcheck import validate_vpk, ValidationResult
 from .vpk_tools import process_server_vpk
 from .vpk_reader import open_vpk
 from .db import init_db, SessionLocal, Upload, AppSetting, ReplicationReservation, WorkshopJob
+from .upload_records import file_fingerprint, read_record, record_path, write_record
 from .docker_manager import DockerManager
 from .aggregation import client_ip_is_allowed, token_is_valid
 from .chunked_upload import ChunkUploadError, ChunkUploadStore
@@ -380,6 +381,18 @@ def _public_url(path: str) -> str:
     return f"{PUBLIC_BASE_URL}{path}"
 
 
+def _upload_origin(upload: Upload) -> str:
+    report = _workshop_json(upload.vpk_report, {})
+    if upload.uploader_ip == "sftp" or (isinstance(report, dict) and "sftp_import" in report):
+        return "sftp"
+    source = report.get("upload_source", {}) if isinstance(report, dict) else {}
+    return "sftp" if source.get("retention_source") == "sftp" else "web"
+
+
+def _persist_upload(upload: Upload, file_stat=None) -> None:
+    write_record(UPLOAD_DIR, upload, file_stat)
+
+
 def thirdparty_map_api_payload() -> dict:
     db = SessionLocal()
     try:
@@ -400,8 +413,10 @@ def thirdparty_map_api_payload() -> dict:
                 "size": item.size,
                 "size_label": _format_mb(item.size or 0),
                 "role": item.role,
-                "created_at": item.created_at.isoformat() if item.created_at else None,
-                "expires_at": item.expires_at.isoformat() if item.expires_at else None,
+                "source": _upload_origin(item),
+                "sha256": item.sha256,
+                "created_at": _as_aware_utc(item.created_at).isoformat() if item.created_at else None,
+                "expires_at": _as_aware_utc(item.expires_at).isoformat() if item.expires_at else None,
                 "detail_url": _public_url(f"/detail/{item.id}"),
                 "download_url": _public_url(f"/d/{item.id}"),
                 "files_url": _public_url(f"/api/uploads/{item.id}/files"),
@@ -781,9 +796,7 @@ def _find_active_upload_by_sha256(db, sha256: str, size: int) -> Optional[Upload
             actual_sha256 = _sha256_file(path)
         except OSError:
             continue
-        if actual_sha256 == sha256:
-            item.sha256 = sha256
-            db.flush()
+        if actual_sha256 == sha256 and item.sha256 == sha256:
             return item
     return None
 
@@ -862,7 +875,10 @@ def _process_vpk_upload(
                 existing = _find_active_upload_by_sha256(db, server_sha256, server_size)
                 if existing is not None:
                     _extend_expiry(existing, expires_at)
+                    if _upload_origin(existing) != "sftp":
+                        existing.created_at = now_utc()
                     db.commit()
+                    _persist_upload(existing)
                     result = _upload_item_result(existing)
                     result["deduplicated"] = True
                     return existing, result
@@ -907,6 +923,7 @@ def _process_vpk_upload(
                         _remove_file_quietly(final_path)
                     raise
                 # 提交后的刷新/响应错误不能再删除已经入库的文件。
+                _persist_upload(up)
                 db.refresh(up)
                 return up, _upload_item_result(up)
     except HTTPException:
@@ -920,135 +937,147 @@ def _process_vpk_upload(
         db.close()
 
 
-def _file_newer_than_upload_record(stat: os.stat_result, upload: Upload) -> bool:
-    created_at = _as_aware_utc(upload.created_at)
-    if not created_at:
-        return False
-    return stat.st_mtime > created_at.timestamp() + 1
+def _same_file_stat(first, second) -> bool:
+    return file_fingerprint(first) == file_fingerprint(second)
+
+
+def _process_sftp_file(db, existing, path, name, stat):
+    """处理副本，成功后原子发布；失败或 SFTP 仍在写入时保留原件。调用方持有容量锁。"""
+    source_path = staged_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".vpk", dir=TMP_DIR, delete=False) as source:
+            source_path = source.name
+        shutil.copyfile(path, source_path)
+        with tempfile.NamedTemporaryFile(prefix=".upload-", suffix=".part", dir=UPLOAD_DIR, delete=False) as staged:
+            staged_path = staged.name
+            fcntl.flock(staged, fcntl.LOCK_EX)
+            max_mb = get_upload_max_mb(db)
+            build = process_server_vpk(source_path, TMP_DIR, UPLOAD_DIR, os.path.basename(staged_path),
+                                       max_size_bytes=max_mb * 1024 * 1024)
+            validation = validate_vpk(staged_path, RULES_FILE, max_size_mb_override=max_mb)
+            if not validation.ok:
+                raise ValueError("SFTP VPK failed validation")
+            if not _same_file_stat(stat, os.stat(path)):
+                return None
+            # 同名就地发布；多句点文件换为 SRCDS 能识别的名称。
+            final_name = name if "." not in name[:-4] else _unique_server_filename(db, name[:-4])
+            final_path = os.path.join(UPLOAD_DIR, final_name)
+            build["server"]["path"] = final_path
+            upload = existing or Upload(stored_name=final_name)
+            upload.original_name = name
+            upload.stored_name = final_name
+            upload.sha256 = _sha256_file(staged_path)
+            upload.size = os.path.getsize(staged_path)
+            upload.role = "admin"
+            upload.created_at = now_utc()
+            upload.expires_at = None
+            upload.vpk_valid = True
+            upload.status = "active"
+            upload.uploader_ip = "sftp"
+            upload.vpk_report = json.dumps({
+                "sftp_import": {"imported_at": upload.created_at.isoformat(), "mtime": stat.st_mtime},
+                "validation": validation.to_dict(), "server_build": build,
+            }, ensure_ascii=False)
+            db.add(upload)
+            db.flush()
+            os.chmod(staged_path, 0o644)
+            if not _same_file_stat(stat, os.stat(path)):
+                db.rollback()
+                return None
+            # 健康原包内容没有变化，无需替换 SFTP 正在使用的 inode。
+            if final_path != path or build.get("mode") != "original":
+                os.replace(staged_path, final_path)
+            else:
+                os.chmod(path, 0o644)
+            db.commit()
+            _persist_upload(upload, file_fingerprint(stat) if final_path == path and build.get("mode") == "original" else None)
+            if final_path != path and _same_file_stat(stat, os.stat(path)):
+                os.remove(path)
+            return upload
+    finally:
+        _remove_file_quietly(source_path)
+        _remove_file_quietly(staged_path)
 
 
 def sync_sftp_uploads(now_ts: Optional[float] = None) -> dict[str, int | bool]:
-    """把 SFTP 放进 uploads 的 .vpk 登记为管理员上传，避免被当作无主文件处理。"""
-    stats: dict[str, int | bool] = {
-        "scanned": 0,
-        "imported": 0,
-        "updated": 0,
-        "existing": 0,
-        "deferred": 0,
-        "errors": 0,
-        "busy": False,
-    }
+    """恢复已登记的来源和期限，只把无记录或内容确实被替换的文件作为 SFTP 处理。"""
+    stats = dict(scanned=0, imported=0, updated=0, existing=0, deferred=0, errors=0, busy=False)
     if not _sftp_scan_lock.acquire(blocking=False):
         stats["busy"] = True
         return stats
-
     if now_ts is None:
         now_ts = time.time()
-
-    db = None
+    db = SessionLocal()
     try:
-        db = SessionLocal()
-        by_name = {row.stored_name: row for row in db.query(Upload).all()}
-        for name in sorted(os.listdir(UPLOAD_DIR)):
+        # 先恢复已有 ID，再登记未知 SFTP 文件，避免它们抢占重建前的记录编号。
+        names = sorted(os.listdir(UPLOAD_DIR), key=lambda name: (not os.path.isfile(record_path(UPLOAD_DIR, name)), name))
+        for name in names:
             if not name.lower().endswith(".vpk"):
                 continue
-
             path = os.path.join(UPLOAD_DIR, name)
-            if not os.path.isfile(path):
+            if not os.path.isfile(path) or os.path.islink(path):
                 continue
             stats["scanned"] += 1
-
             try:
                 stat = os.stat(path)
-            except OSError:
-                stats["errors"] += 1
-                continue
-
-            if now_ts - stat.st_mtime < SFTP_IMPORT_MIN_AGE_SECONDS:
-                stats["deferred"] += 1
-                continue
-
-            existing = by_name.get(name)
-            if existing and existing.status == "active" and not _file_newer_than_upload_record(stat, existing):
-                stats["existing"] += 1
-                continue
-
-            try:
-                imported_at = now_utc()
-                file_sha256 = _sha256_file(path)
+                record = read_record(UPLOAD_DIR, name)
+                existing = db.query(Upload).filter(Upload.stored_name == name).first()
+                report = _workshop_json(existing.vpk_report, {}) if existing else {}
+                needs_processing = existing is not None and _upload_origin(existing) == "sftp" and not report.get("server_build")
+                fingerprint = record.get("file_stat") if record else None
+                if (existing and existing.status == "active" and not needs_processing and fingerprint
+                        and record["upload"]["sha256"] == existing.sha256
+                        and fingerprint == file_fingerprint(stat)):
+                    stats["existing"] += 1
+                    continue
+                if now_ts - stat.st_mtime < SFTP_IMPORT_MIN_AGE_SECONDS:
+                    stats["deferred"] += 1
+                    continue
+                digest = _sha256_file(path)
                 with capacity_guard():
-                    # 发布方可能刚完成提交，必须重新查询，不能沿用扫描开始时的快照。
                     db.expire_all()
                     existing = db.query(Upload).filter(Upload.stored_name == name).first()
-                    if existing and existing.status == "active" and not _file_newer_than_upload_record(stat, existing):
-                        stats["existing"] += 1
-                        continue
-                    final_stat = os.stat(path)
-                    if final_stat.st_size != stat.st_size or final_stat.st_mtime_ns != stat.st_mtime_ns:
+                    if not _same_file_stat(stat, os.stat(path)):
                         stats["deferred"] += 1
                         continue
-                    try:
-                        validation = validate_vpk(path, RULES_FILE, max_size_mb_override=get_upload_max_mb(db))
-                        if not validation.ok:
-                            raise ValueError("地图有问题，无法部署：SFTP 文件未通过规则校验")
-                    except ValueError as exc:
-                        # SFTP 已经直接写入挂载目录；只拒绝登记，不擅自移动管理员的文件。
-                        if existing:
-                            existing.vpk_valid = False
-                            existing.status = "invalid"
-                            existing.vpk_report = json.dumps({"validation": {"ok": False, "error": str(exc)}}, ensure_ascii=False)
-                            db.commit()
-                        stats["errors"] += 1
-                        logger.warning("SFTP VPK rejected name=%r: %s", name, exc)
-                        continue
-                    report = {
-                        "validation": validation.to_dict(),
-                        "sftp_import": {
-                            "imported_at": imported_at.isoformat(),
-                            "mtime": stat.st_mtime,
-                            "note": "SFTP 上传文件按管理员上传处理，未经过网页端重打包。",
-                        }
-                    }
-                    if existing:
-                        existing.original_name = name
-                        existing.sha256 = file_sha256
-                        existing.size = stat.st_size
-                        existing.role = "admin"
-                        existing.created_at = imported_at
-                        existing.expires_at = None
-                        existing.vpk_valid = True
-                        existing.vpk_report = json.dumps(report, ensure_ascii=False)
-                        existing.status = "active"
-                        existing.uploader_ip = "sftp"
-                        stats["updated"] += 1
-                    else:
-                        existing = Upload(
-                            original_name=name,
-                            stored_name=name,
-                            sha256=file_sha256,
-                            size=stat.st_size,
-                            role="admin",
-                            created_at=imported_at,
-                            expires_at=None,
-                            vpk_valid=True,
-                            vpk_report=json.dumps(report, ensure_ascii=False),
-                            status="active",
-                            uploader_ip="sftp",
-                        )
+                    # 数据库重建时，只有文件哈希也一致才恢复持久记录；不依赖文件名猜来源。
+                    if existing is None and record and record["upload"]["sha256"] == digest:
+                        values = dict(record["upload"])
+                        if db.get(Upload, values["id"]) is not None:
+                            values.pop("id")
+                        existing = Upload(**values)
                         db.add(existing)
-                        stats["imported"] += 1
-
-                    db.commit()
-                    by_name[name] = existing
+                        db.commit()
+                    if existing and existing.status == "active" and existing.sha256 == digest:
+                        report = _workshop_json(existing.vpk_report, {})
+                        if _upload_origin(existing) != "sftp" or report.get("server_build"):
+                            _persist_upload(existing, file_fingerprint(stat))
+                            stats["existing"] += 1
+                            continue
+                    was_existing = existing is not None
+                    try:
+                        upload = _process_sftp_file(db, existing, path, name, stat)
+                    except ValueError:
+                        if existing:
+                            # 无法确认原内容仍在时，禁止按旧期限删除管理员刚覆盖的原件。
+                            db.rollback()
+                            existing = db.query(Upload).filter(Upload.stored_name == name).first()
+                            if existing:
+                                existing.status = "invalid"
+                                existing.vpk_valid = False
+                                db.commit()
+                        raise
+                    if upload is None:
+                        stats["deferred"] += 1
+                    else:
+                        stats["updated" if was_existing else "imported"] += 1
             except Exception:
                 db.rollback()
                 stats["errors"] += 1
-                logger.exception("Failed to import SFTP VPK: %s", name)
-
+                logger.exception("Failed to process SFTP VPK: %s", name)
         return stats
     finally:
-        if db is not None:
-            db.close()
+        db.close()
         _sftp_scan_lock.release()
 
 
@@ -1056,6 +1085,7 @@ async def _sftp_sync_loop() -> None:
     while True:
         try:
             stats = await asyncio.to_thread(sync_sftp_uploads)
+            await asyncio.to_thread(cleanup_expired)
             if stats["imported"] or stats["updated"] or stats["errors"]:
                 logger.info("SFTP upload scan completed: %s", stats)
             await asyncio.sleep(SFTP_SCAN_INTERVAL_SECONDS)
@@ -1090,28 +1120,21 @@ async def stop_sftp_sync() -> None:
 def cleanup_expired():
     db = SessionLocal()
     try:
-        utcnow = now_utc()
-        candidates = db.query(Upload).filter(
-            Upload.expires_at.isnot(None),
-            Upload.status == "active",
-        ).all()
-
-        expired = [
-            u for u in candidates
-            if (_as_aware_utc(u.expires_at) and _as_aware_utc(u.expires_at) < utcnow)
-        ]
-
-        for u in expired:
-            try:
-                path = os.path.join(UPLOAD_DIR, u.stored_name)
-                if os.path.exists(path):
-                    os.remove(path)
-            except Exception:
-                pass
-            u.status = "deleted"
-
-        if expired:
-            db.commit()
+        with capacity_guard():
+            candidates = db.query(Upload).filter(
+                Upload.expires_at.isnot(None), Upload.status == "active",
+            ).all()
+            for upload in candidates:
+                if _upload_origin(upload) == "sftp" or _as_aware_utc(upload.expires_at) > now_utc():
+                    continue
+                try:
+                    _delete_upload_file(upload)
+                    db.commit()
+                    _persist_upload(upload)
+                except (OSError, HTTPException):
+                    # 删除失败保留 active，下次重试；不能把残留文件重新认成永久 SFTP。
+                    db.rollback()
+                    logger.warning("Expired upload could not be removed id=%s", upload.id)
     finally:
         db.close()
 
@@ -1721,6 +1744,7 @@ def _replication_manifest_items(payload: Any) -> list[dict[str, Any]]:
     db = SessionLocal()
     try:
         max_bytes = get_upload_max_mb(db) * 1024 * 1024
+        guest_ttl = get_guest_ttl_hours(db)
     finally:
         db.close()
 
@@ -1745,6 +1769,20 @@ def _replication_manifest_items(payload: Any) -> list[dict[str, Any]]:
             raise HTTPException(status_code=400, detail=f"复制文件 {original_name} 大小超出单文件限制")
         if source_upload_id < 1:
             raise HTTPException(status_code=400, detail=f"复制文件 {original_name} 来源 ID 无效")
+        role = str(raw_item.get("role", "guest"))
+        source = str(raw_item.get("source", "web"))
+        if role not in WORKSHOP_ROLES or source not in {"web", "sftp"}:
+            raise HTTPException(status_code=400, detail="复制文件来源或角色无效")
+        try:
+            created_at = _as_aware_utc(datetime.fromisoformat(raw_item["created_at"])) if raw_item.get("created_at") else now_utc()
+            if "expires_at" in raw_item:
+                expires_at = _as_aware_utc(datetime.fromisoformat(raw_item["expires_at"])) if raw_item["expires_at"] else None
+            else:
+                expires_at = now_utc() + timedelta(hours=guest_ttl) if guest_ttl > 0 else None
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail="复制文件时间无效") from exc
+        if source == "sftp":
+            role, expires_at = "admin", None
         seen_hashes.add(sha256)
         items.append({
             "source_upload_id": source_upload_id,
@@ -1753,8 +1791,31 @@ def _replication_manifest_items(payload: Any) -> list[dict[str, Any]]:
             "size": size,
             "sha256": sha256,
             "status": "pending",
+            "role": role,
+            "source": source,
+            "created_at": created_at.isoformat(),
+            "expires_at": expires_at.isoformat() if expires_at else None,
         })
     return items
+
+
+def _renew_replica(upload: Upload, item: dict) -> None:
+    if _upload_origin(upload) == "sftp":
+        return
+    expiry = datetime.fromisoformat(item["expires_at"]) if item.get("expires_at") else None
+    created = datetime.fromisoformat(item["created_at"]) if item.get("created_at") else None
+    if created and (upload.created_at is None or _as_aware_utc(created) > _as_aware_utc(upload.created_at)):
+        upload.created_at = created
+    report = _workshop_json(upload.vpk_report, {})
+    source = report.get("upload_source", {})
+    if source.get("source") == "lan_replication" and "retention_source" not in source:
+        # 旧复制接口曾无条件设为永久；新的来源记录可证明其真实期限。
+        upload.expires_at = expiry
+    else:
+        _extend_expiry(upload, expiry)
+    if source.get("source") == "lan_replication":
+        source["retention_source"] = item.get("source", "web")
+        upload.vpk_report = json.dumps(report, ensure_ascii=False)
 
 
 def _load_reservation_manifest(row: ReplicationReservation) -> dict[str, Any]:
@@ -1826,8 +1887,11 @@ def _replication_preflight(source_node_id: str, payload: Any) -> dict[str, Any]:
                 if existing is None:
                     missing.append(item)
                 else:
+                    _renew_replica(existing, item)
                     already_present.append(_upload_item_result(existing))
             db.commit()
+            for result in already_present:
+                _persist_upload(db.get(Upload, result["id"]))
 
             snapshot = replication_storage_snapshot(db)
             required_bytes = sum(int(item["size"]) for item in missing)
@@ -1918,6 +1982,10 @@ def _replication_artifacts_for_uploads(uploads: list[Upload]) -> list[Replicatio
             path=path,
             size=int(upload.size or os.path.getsize(path)),
             sha256=sha256,
+            role=upload.role,
+            source=_upload_origin(upload),
+            created_at=_as_aware_utc(upload.created_at).isoformat() if upload.created_at else None,
+            expires_at=_as_aware_utc(upload.expires_at).isoformat() if upload.expires_at else None,
         ))
     return artifacts
 
@@ -1929,17 +1997,35 @@ def get_docker_manager() -> DockerManager:
         raise HTTPException(status_code=503, detail=f"无法连接 Docker：{exc}") from exc
 
 
-def delete_upload_item(item_id: int) -> None:
+def _delete_upload_file(item: Upload) -> None:
+    path = os.path.join(UPLOAD_DIR, item.stored_name)
+    if os.path.lexists(path):
+        stat = os.stat(path)
+        if (os.path.islink(path) or _sha256_file(path) != item.sha256
+                or not _same_file_stat(stat, os.stat(path))):
+            raise HTTPException(status_code=409, detail="文件内容已改变，请刷新地图清单后重试")
+        os.remove(path)
+    item.status = "deleted"
+
+
+def delete_upload_item(item_id: int, *, sourcebans: bool = False, expected_sha256: str = "") -> None:
     db = SessionLocal()
     try:
-        item = db.get(Upload, item_id)
-        if not item:
-            raise HTTPException(status_code=404, detail="上传文件不存在")
-        path = os.path.join(UPLOAD_DIR, item.stored_name)
-        if os.path.exists(path):
-            os.remove(path)
-        item.status = "deleted"
-        db.commit()
+        with capacity_guard():
+            item = db.get(Upload, item_id)
+            if not item or item.status != "active":
+                raise HTTPException(status_code=404, detail="上传文件不存在")
+            if sourcebans:
+                if _upload_origin(item) == "sftp":
+                    raise HTTPException(status_code=403, detail="SFTP 地图永久保留，不能在此删除")
+                created_at = _as_aware_utc(item.created_at)
+                if created_at is None or now_utc() < created_at + timedelta(hours=24):
+                    raise HTTPException(status_code=403, detail="地图上传满 24 小时后才可删除")
+                if not _valid_sha256(expected_sha256) or not secrets.compare_digest(expected_sha256, item.sha256 or ""):
+                    raise HTTPException(status_code=409, detail="上传记录已改变，请刷新地图清单后重试")
+            _delete_upload_file(item)
+            db.commit()
+            _persist_upload(item)
     finally:
         db.close()
 
@@ -2041,11 +2127,13 @@ async def receive_lan_replication_upload(
 
                 existing = _find_active_upload_by_sha256(db, expected_sha256, expected_size)
                 if existing is not None:
+                    _renew_replica(existing, item)
                     item["status"] = "already_present"
                     item["target_upload_id"] = existing.id
                     row.reserved_bytes = max(0, int(row.reserved_bytes or 0) - expected_size)
                     _save_reservation_manifest(row, manifest)
                     db.commit()
+                    _persist_upload(existing)
                     return {
                         "ok": True,
                         "status": "already_present",
@@ -2060,6 +2148,7 @@ async def receive_lan_replication_upload(
                 report = {
                     "upload_source": {
                         "source": "lan_replication",
+                        "retention_source": item.get("source", "web"),
                         "source_node_id": source_node_id,
                         "source_upload_id": source_upload_id,
                         "received_sha256": expected_sha256,
@@ -2076,9 +2165,9 @@ async def receive_lan_replication_upload(
                     stored_name=final_name,
                     sha256=expected_sha256,
                     size=expected_size,
-                    role="admin",
-                    created_at=now_utc(),
-                    expires_at=None,
+                    role=item.get("role", "guest"),
+                    created_at=datetime.fromisoformat(item["created_at"]) if item.get("created_at") else now_utc(),
+                    expires_at=datetime.fromisoformat(item["expires_at"]) if item.get("expires_at") else None,
                     vpk_valid=True,
                     vpk_report=json.dumps(report, ensure_ascii=False),
                     status="active",
@@ -2091,6 +2180,8 @@ async def receive_lan_replication_upload(
                 row.reserved_bytes = max(0, int(row.reserved_bytes or 0) - expected_size)
                 _save_reservation_manifest(row, manifest)
                 db.commit()
+                final_path = ""  # 提交成功后的记录同步失败不能删除成品。
+                _persist_upload(upload)
                 db.refresh(upload)
                 return {"ok": True, "status": "stored", "upload": _upload_item_result(upload)}
         except Exception:
@@ -2414,6 +2505,20 @@ def federation_docker_files(request: Request, container_id: str, path: str = "/"
 def federation_upload_delete(request: Request, item_id: int):
     require_federation_token(request)
     delete_upload_item(item_id)
+    return {"ok": True}
+
+
+@app.post("/api/federation/uploads/{item_id}/delete-map")
+async def federation_map_delete(request: Request, item_id: int):
+    require_federation_token(request)
+    try:
+        payload = await request.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+    await asyncio.to_thread(delete_upload_item, item_id, sourcebans=True,
+                            expected_sha256=str(payload.get("sha256", "")))
     return {"ok": True}
 
 
@@ -3135,6 +3240,7 @@ async def admin_set_expiry(request: Request, item_id: int, hours: int = Form(...
             raise HTTPException(status_code=404)
         item.expires_at = (now_utc() + timedelta(hours=hours)) if hours > 0 else None
         db.commit()
+        _persist_upload(item)
     finally:
         db.close()
     return RedirectResponse(url="/admin", status_code=302)

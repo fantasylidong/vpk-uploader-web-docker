@@ -103,6 +103,10 @@ class ReplicationArtifact:
     path: str
     size: int
     sha256: str
+    role: str = "guest"
+    source: str = "web"
+    created_at: Optional[str] = None
+    expires_at: Optional[str] = None
 
     def manifest_item(self) -> dict[str, Any]:
         return {
@@ -111,6 +115,10 @@ class ReplicationArtifact:
             "stored_name": self.stored_name,
             "size": self.size,
             "sha256": self.sha256,
+            "role": self.role,
+            "source": self.source,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
         }
 
 
