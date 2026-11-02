@@ -246,6 +246,7 @@ docker run -d --name vpk-uploader -p 8080:8080   -e APP_SECRET="change-me" -e AD
 
 ## 目录说明
 - `/app/data/uploads`：完整 VPK 原包及尚未过期的旧版成品；也可通过 SFTP 直接放入 `.vpk`，系统会按管理员上传自动登记
+- `/app/data/.upload-records`：私有上传来源和有效期记录，位于游戏挂载目录外；升级后首次后台扫描会自动迁移旧的 `uploads/.upload-records`，保留记录及私有权限。应持久挂载整个 `/app/data`，游戏仅挂载 `uploads`。
 - `/app/data/tmp`：上传临时文件（流程结束即删，附兜底清理）
 - `/app/data/upload_sessions`：断点续传会话与未完成分片（自动过期清理）
 - `/app/data/steamcmd`：steamcmd 安装目录、自更新内容和创意工坊下载缓存（物品处理完即删）

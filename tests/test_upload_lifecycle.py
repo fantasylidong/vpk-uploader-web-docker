@@ -16,7 +16,7 @@ from tests import test_upload_publication as publication
 from tests.test_vpk_integrity import missing_outer_terminator
 from app import main
 from app.db import SessionLocal, Upload
-from app.upload_records import read_record
+from app.upload_records import read_record, record_path
 
 map_bytes = publication.map_bytes
 
@@ -27,11 +27,68 @@ class UploadLifecycleTest(unittest.TestCase):
     def setUp(self):
         publication.UploadPublicationTest.setUp(self)
         shutil.rmtree(Path(main.UPLOAD_DIR) / '.upload-records', ignore_errors=True)
+        shutil.rmtree(Path(main.DATA_DIR) / '.upload-records', ignore_errors=True)
         main.set_guest_ttl_hours(72)
 
     def row(self, upload_id):
         with SessionLocal() as db:
             return db.get(Upload, upload_id)
+
+    def test_records_stay_outside_game_mount_and_migrate_legacy_before_rebuild(self):
+        result = self.upload(map_bytes())
+        original = self.row(result['id'])
+        record = Path(record_path(main.UPLOAD_DIR, result['stored_name']))
+        self.assertEqual(record.parent, Path(main.DATA_DIR) / '.upload-records')
+        self.assertEqual(record.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(record.parent.stat().st_mode & 0o777, 0o700)
+        legacy = Path(main.UPLOAD_DIR) / '.upload-records'
+        legacy.mkdir(mode=0o700)
+        record.rename(legacy / record.name)
+        with SessionLocal() as db:
+            db.query(Upload).delete()
+            db.commit()
+        stats = main.sync_sftp_uploads(now_ts=main.time.time() + 120)
+        self.assertEqual(stats['errors'], 0)
+        self.assertFalse(legacy.exists())
+        self.assertTrue(record.is_file())
+        restored = self.row(result['id'])
+        self.assertEqual(restored.role, original.role)
+        self.assertEqual(restored.created_at, original.created_at)
+        self.assertEqual(restored.expires_at, original.expires_at)
+        self.assertEqual(main._upload_origin(restored), 'web')
+
+    def test_interrupted_record_migration_preserves_source_and_can_retry(self):
+        result = self.upload(map_bytes())
+        record = Path(record_path(main.UPLOAD_DIR, result['stored_name']))
+        expected = record.read_bytes()
+        legacy = Path(main.UPLOAD_DIR) / '.upload-records'
+        legacy.mkdir(mode=0o700)
+        source = legacy / record.name
+        record.rename(source)
+        with patch('app.upload_records.shutil.copyfileobj', side_effect=OSError('copy failed')):
+            with self.assertRaisesRegex(OSError, 'copy failed'):
+                read_record(main.UPLOAD_DIR, result['stored_name'])
+        self.assertEqual(source.read_bytes(), expected)
+        self.assertFalse(record.exists())
+        self.assertFalse(list(record.parent.glob('.record-*')))
+        self.assertEqual(read_record(main.UPLOAD_DIR, result['stored_name'])['upload']['id'], result['id'])
+        self.assertFalse(legacy.exists())
+
+    def test_record_migration_retries_identical_records_but_preserves_conflicts(self):
+        result = self.upload(map_bytes())
+        record = Path(record_path(main.UPLOAD_DIR, result['stored_name']))
+        expected = record.read_bytes()
+        legacy = Path(main.UPLOAD_DIR) / '.upload-records'
+        legacy.mkdir(mode=0o700)
+        source = legacy / record.name
+        source.write_bytes(b'conflicting record')
+        with self.assertRaises(FileExistsError):
+            read_record(main.UPLOAD_DIR, result['stored_name'])
+        self.assertEqual(source.read_bytes(), b'conflicting record')
+        self.assertEqual(record.read_bytes(), expected)
+        source.write_bytes(expected)
+        self.assertEqual(read_record(main.UPLOAD_DIR, result['stored_name'])['upload']['id'], result['id'])
+        self.assertFalse(legacy.exists())
 
     def test_rebuild_recovers_web_timestamps_then_expires_only_web(self):
         created = main.now_utc() - timedelta(hours=70)

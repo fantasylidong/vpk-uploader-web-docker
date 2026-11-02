@@ -1,8 +1,10 @@
-"""随地图目录保留生命周期记录，SQLite 丢失时仍能识别网页上传。"""
+"""在游戏挂载目录外持久保存生命周期记录，SQLite 丢失时仍能识别网页上传。"""
 
+import fcntl
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 from datetime import datetime
 
@@ -20,7 +22,42 @@ def file_fingerprint(stat) -> dict:
 
 def record_path(upload_dir: str, name: str) -> str:
     key = hashlib.sha256(name.encode("utf-8")).hexdigest()
-    return os.path.join(upload_dir, ".upload-records", key + ".json")
+    directory = os.path.join(os.path.dirname(os.path.abspath(upload_dir)), ".upload-records")
+    _migrate_records(os.path.join(upload_dir, ".upload-records"), directory)
+    return os.path.join(directory, key + ".json")
+
+
+def _migrate_records(legacy: str, directory: str) -> None:
+    if not os.path.isdir(legacy):
+        return
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    with open(os.path.join(directory, ".migration.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not os.path.isdir(legacy):
+            return
+        for name in os.listdir(legacy):
+            source = os.path.join(legacy, name)
+            destination = os.path.join(directory, name)
+            if os.path.exists(destination):
+                with open(source, "rb") as old, open(destination, "rb") as current:
+                    if old.read() != current.read():
+                        raise FileExistsError(f"Conflicting upload record: {name}")
+            else:
+                temporary = None
+                try:
+                    # uploads 可单独挂载：先在目标卷完整落盘，再移除旧记录。
+                    with tempfile.NamedTemporaryFile(dir=directory, prefix=".record-", delete=False) as target:
+                        temporary = target.name
+                        with open(source, "rb") as old:
+                            shutil.copyfileobj(old, target)
+                        target.flush()
+                        os.fsync(target.fileno())
+                    os.replace(temporary, destination)
+                finally:
+                    if temporary and os.path.exists(temporary):
+                        os.remove(temporary)
+            os.remove(source)
+        os.rmdir(legacy)
 
 
 def write_record(upload_dir: str, upload, file_stat=None) -> None:
